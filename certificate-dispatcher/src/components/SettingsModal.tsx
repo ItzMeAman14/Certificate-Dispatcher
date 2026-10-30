@@ -1,5 +1,17 @@
 import { useState } from 'react';
-import { AlertTriangle, Check, Loader2, Mail, Save, Settings as SettingsIcon, Zap, X } from 'lucide-react';
+import {
+  AlertTriangle,
+  Check,
+  Globe,
+  Loader2,
+  Mail,
+  Save,
+  Server,
+  Settings as SettingsIcon,
+  ShieldCheck,
+  Zap,
+  X,
+} from 'lucide-react';
 import { ApiError, api, errorText } from '../api.ts';
 import type { PublicSettings } from '../api.ts';
 
@@ -38,8 +50,10 @@ function Section({ title, description, children }: { title: string; description:
 export default function SettingsModal({ settings, onSaved, onUnauthorized, onClose }: Props) {
   const [form, setForm] = useState({
     ...settings,
+    emailProvider: settings.emailProvider || (settings.hasBrevoApiKey ? 'brevo_api' : 'brevo_api'),
+    brevoApiKey: '',
     fromEmail: settings.fromEmail || '',
-    dailyLimit: settings.dailyLimit ?? 0,
+    dailyLimit: settings.dailyLimit ?? 250,
     smtpPassword: '',
   });
   const [busy, setBusy] = useState(false);
@@ -51,15 +65,17 @@ export default function SettingsModal({ settings, onSaved, onUnauthorized, onClo
   const applyGmailPreset = () => {
     setForm((f) => ({
       ...f,
+      emailProvider: 'smtp',
       smtpHost: 'smtp.gmail.com',
       smtpPort: 465,
       dailyLimit: 0,
     }));
   };
 
-  const applyBrevoPreset = () => {
+  const applyBrevoSmtpPreset = () => {
     setForm((f) => ({
       ...f,
+      emailProvider: 'smtp',
       smtpHost: 'smtp-relay.brevo.com',
       smtpPort: 2525,
       dailyLimit: 250,
@@ -99,19 +115,19 @@ export default function SettingsModal({ settings, onSaved, onUnauthorized, onClo
             <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-indigo-50 text-indigo-600">
               <SettingsIcon className="h-5 w-5" aria-hidden />
             </div>
-            <h2 className="text-base font-semibold text-slate-900">Settings</h2>
+            <h2 className="text-base font-semibold text-slate-900">Email & Mailbox Settings</h2>
           </div>
           <button
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="rounded-lg p-2 text-slate-500 hover:bg-slate-100"
+            className="rounded-lg p-2 text-slate-500 hover:bg-slate-100 cursor-pointer"
           >
             <X className="h-5 w-5" aria-hidden />
           </button>
         </div>
 
-        <div className="space-y-8 overflow-y-auto px-6 py-5">
+        <div className="space-y-6 overflow-y-auto px-6 py-5">
           {error && (
             <div
               role="alert"
@@ -122,128 +138,206 @@ export default function SettingsModal({ settings, onSaved, onUnauthorized, onClo
             </div>
           )}
 
+          {/* Delivery Method Selection */}
           <Section
-            title="Sender email"
-            description="Certificates are sent from this mailbox. We test the login before saving."
+            title="Email Dispatch Method"
+            description="Choose how certificates are sent. Brevo REST API is required for Render because Render blocks standard SMTP ports."
           >
-            {/* Quick-setup Presets */}
-            <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3.5">
-              <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                Quick Setup Provider
-              </span>
-              <div className="mt-2 flex flex-wrap gap-2.5">
-                <button
-                  type="button"
-                  onClick={applyGmailPreset}
-                  className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition ${
-                    form.smtpHost === 'smtp.gmail.com' && form.smtpPort === 465
-                      ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
-                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
-                  }`}
+            <div className="grid gap-3 sm:grid-cols-2">
+              <button
+                type="button"
+                onClick={() => set('emailProvider', 'brevo_api')}
+                className={`relative flex flex-col p-4 text-left rounded-xl border transition cursor-pointer ${
+                  form.emailProvider === 'brevo_api'
+                    ? 'border-indigo-600 bg-indigo-50/60 ring-2 ring-indigo-500/20'
+                    : 'border-slate-200 bg-white hover:bg-slate-50'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Globe className="h-5 w-5 text-indigo-600" />
+                    <span className="font-semibold text-slate-900 text-sm">Brevo REST API</span>
+                  </div>
+                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-800">
+                    <ShieldCheck className="h-3 w-3" />
+                    Render Safe (Port 443)
+                  </span>
+                </div>
+                <p className="mt-2 text-xs text-slate-500 leading-relaxed">
+                  Sends via standard HTTPS (Port 443). Bypasses Render port blocking 100% reliably.
+                </p>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => set('emailProvider', 'smtp')}
+                className={`relative flex flex-col p-4 text-left rounded-xl border transition cursor-pointer ${
+                  form.emailProvider === 'smtp'
+                    ? 'border-indigo-600 bg-indigo-50/60 ring-2 ring-indigo-500/20'
+                    : 'border-slate-200 bg-white hover:bg-slate-50'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Server className="h-5 w-5 text-slate-600" />
+                    <span className="font-semibold text-slate-900 text-sm">SMTP Server</span>
+                  </div>
+                  <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-600">
+                    Ports 465 / 587
+                  </span>
+                </div>
+                <p className="mt-2 text-xs text-slate-500 leading-relaxed">
+                  Direct SMTP relay. Best for local development or hosts with unblocked SMTP.
+                </p>
+              </button>
+            </div>
+
+            {/* Provider Configuration Forms */}
+            {form.emailProvider === 'brevo_api' ? (
+              <div className="space-y-4 rounded-xl border border-indigo-100 bg-indigo-50/40 p-4">
+                <div className="flex items-start gap-2.5 text-xs text-indigo-900">
+                  <Zap className="h-4 w-4 shrink-0 text-indigo-600 mt-0.5" />
+                  <div>
+                    <strong>How to get your Brevo API key:</strong> Log in to Brevo → click your name (top right) →{' '}
+                    <strong>SMTP & API</strong> → <strong>API Keys</strong> tab → click <strong>Generate a new API key</strong>.
+                    Key starts with <code className="font-mono font-semibold">xkeysib-...</code>.
+                  </div>
+                </div>
+
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Field
+                    label="Brevo API Key (v3)"
+                    hint={
+                      form.hasBrevoApiKey
+                        ? 'An API key is saved. Leave empty to keep it.'
+                        : 'Starts with xkeysib-...'
+                    }
+                  >
+                    <input
+                      type="password"
+                      value={form.brevoApiKey}
+                      onChange={(e) => set('brevoApiKey', e.target.value)}
+                      placeholder={form.hasBrevoApiKey ? '••••••••••••••••' : 'xkeysib-...'}
+                      className={inputCls}
+                      autoComplete="off"
+                    />
+                  </Field>
+
+                  <Field
+                    label="Verified Sender Email"
+                    hint="Must be verified in Brevo (Senders & IP → Senders)."
+                  >
+                    <input
+                      type="email"
+                      required
+                      value={form.fromEmail || form.smtpUser}
+                      onChange={(e) => {
+                        set('fromEmail', e.target.value);
+                        set('smtpUser', e.target.value);
+                      }}
+                      placeholder="sender@yourdomain.com"
+                      className={inputCls}
+                    />
+                  </Field>
+                </div>
+
+                <Field
+                  label="Daily send limit"
+                  hint="Emails per rolling 24h. Brevo free plan allows 300/day (250 recommended)."
                 >
-                  <Mail className="h-3.5 w-3.5" />
-                  Gmail (smtp.gmail.com:465)
-                  {form.smtpHost === 'smtp.gmail.com' && form.smtpPort === 465 && (
-                    <Check className="h-3 w-3 text-indigo-600" />
-                  )}
-                </button>
-                <button
-                  type="button"
-                  onClick={applyBrevoPreset}
-                  className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition ${
-                    form.smtpHost === 'smtp-relay.brevo.com' && form.smtpPort === 2525
-                      ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
-                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
-                  }`}
-                >
-                  <Zap className="h-3.5 w-3.5 text-amber-500" />
-                  Brevo (Port 2525, Limit 250)
-                  {form.smtpHost === 'smtp-relay.brevo.com' && form.smtpPort === 2525 && (
-                    <Check className="h-3 w-3 text-indigo-600" />
-                  )}
-                </button>
-              </div>
-            </div>
-
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field label="SMTP username / email">
-                <input
-                  type="email"
-                  value={form.smtpUser}
-                  onChange={(e) => set('smtpUser', e.target.value)}
-                  placeholder="user@example.com"
-                  className={inputCls}
-                  autoComplete="off"
-                />
-              </Field>
-              <Field
-                label="App password"
-                hint={
-                  form.hasSmtpPassword
-                    ? 'A password is saved. Leave empty to keep it.'
-                    : 'For Gmail: Google Account → Security → App passwords. For Brevo: SMTP Master Password.'
-                }
-              >
-                <input
-                  type="password"
-                  value={form.smtpPassword}
-                  onChange={(e) => set('smtpPassword', e.target.value)}
-                  placeholder={form.hasSmtpPassword ? '••••••••••••••••' : ''}
-                  className={inputCls}
-                  autoComplete="new-password"
-                />
-              </Field>
-            </div>
-
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field
-                label="Verified sender email (optional)"
-                hint="Used as From email header (fromEmail || smtpUser). Required by Brevo if different from login."
-              >
-                <input
-                  type="email"
-                  value={form.fromEmail}
-                  onChange={(e) => set('fromEmail', e.target.value)}
-                  placeholder="verified@yourdomain.com"
-                  className={inputCls}
-                />
-              </Field>
-              <Field
-                label="Daily send limit"
-                hint="Rolling 24h limit (0 = unlimited). Brevo free tier is 300/day (250 recommended)."
-              >
-                <input
-                  type="number"
-                  min="0"
-                  value={form.dailyLimit}
-                  onChange={(e) => set('dailyLimit', Math.max(0, parseInt(e.target.value, 10) || 0))}
-                  className={inputCls}
-                />
-              </Field>
-            </div>
-
-            <details className="rounded-lg border border-slate-200 px-3 py-2 text-sm">
-              <summary className="cursor-pointer font-medium text-slate-700">
-                Advanced Mail server settings
-              </summary>
-              <div className="mt-3 grid gap-4 sm:grid-cols-2">
-                <Field label="SMTP host">
-                  <input
-                    value={form.smtpHost}
-                    onChange={(e) => set('smtpHost', e.target.value)}
-                    className={inputCls}
-                  />
-                </Field>
-                <Field label="Port" hint="465 (SSL), 587 (STARTTLS), 25 or 2525">
                   <input
                     type="number"
-                    value={form.smtpPort}
-                    onChange={(e) => set('smtpPort', Number(e.target.value))}
+                    min="0"
+                    value={form.dailyLimit}
+                    onChange={(e) => set('dailyLimit', Math.max(0, parseInt(e.target.value, 10) || 0))}
                     className={inputCls}
                   />
                 </Field>
               </div>
-            </details>
+            ) : (
+              <div className="space-y-4 rounded-xl border border-slate-200 bg-slate-50/60 p-4">
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={applyGmailPreset}
+                    className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition cursor-pointer ${
+                      form.smtpHost === 'smtp.gmail.com' && form.smtpPort === 465
+                        ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
+                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                    }`}
+                  >
+                    <Mail className="h-3.5 w-3.5" />
+                    Gmail Preset (465)
+                    {form.smtpHost === 'smtp.gmail.com' && form.smtpPort === 465 && (
+                      <Check className="h-3 w-3 text-indigo-600" />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={applyBrevoSmtpPreset}
+                    className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition cursor-pointer ${
+                      form.smtpHost === 'smtp-relay.brevo.com' && form.smtpPort === 2525
+                        ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
+                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                    }`}
+                  >
+                    <Zap className="h-3.5 w-3.5 text-amber-500" />
+                    Brevo SMTP Preset (2525)
+                    {form.smtpHost === 'smtp-relay.brevo.com' && form.smtpPort === 2525 && (
+                      <Check className="h-3 w-3 text-indigo-600" />
+                    )}
+                  </button>
+                </div>
+
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Field label="SMTP username / email">
+                    <input
+                      type="email"
+                      value={form.smtpUser}
+                      onChange={(e) => set('smtpUser', e.target.value)}
+                      placeholder="user@example.com"
+                      className={inputCls}
+                      autoComplete="off"
+                    />
+                  </Field>
+                  <Field
+                    label="App password / SMTP Key"
+                    hint={
+                      form.hasSmtpPassword
+                        ? 'A password is saved. Leave empty to keep it.'
+                        : 'For Brevo: SMTP Key under SMTP tab. For Gmail: App password.'
+                    }
+                  >
+                    <input
+                      type="password"
+                      value={form.smtpPassword}
+                      onChange={(e) => set('smtpPassword', e.target.value)}
+                      placeholder={form.hasSmtpPassword ? '••••••••••••••••' : ''}
+                      className={inputCls}
+                      autoComplete="new-password"
+                    />
+                  </Field>
+                </div>
+
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Field label="SMTP host">
+                    <input
+                      value={form.smtpHost}
+                      onChange={(e) => set('smtpHost', e.target.value)}
+                      className={inputCls}
+                    />
+                  </Field>
+                  <Field label="Port" hint="465 (SSL), 587 (STARTTLS), 25 or 2525">
+                    <input
+                      type="number"
+                      value={form.smtpPort}
+                      onChange={(e) => set('smtpPort', Number(e.target.value))}
+                      className={inputCls}
+                    />
+                  </Field>
+                </div>
+              </div>
+            )}
           </Section>
 
           <Section
@@ -301,21 +395,21 @@ export default function SettingsModal({ settings, onSaved, onUnauthorized, onClo
           </Section>
         </div>
 
-        <div className="flex justify-end gap-2 border-t border-slate-200 px-6 py-3">
+        <div className="flex justify-end gap-2 border-t border-slate-200 px-6 py-3 bg-slate-50/50">
           <button
             type="button"
             onClick={onClose}
-            className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+            className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
           >
             Cancel
           </button>
           <button
             type="submit"
             disabled={busy}
-            className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700 disabled:opacity-70"
+            className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700 disabled:opacity-70 cursor-pointer"
           >
             {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Save className="h-4 w-4" aria-hidden />}
-            {busy ? 'Saving…' : 'Save settings'}
+            {busy ? 'Verifying & Saving…' : 'Save settings'}
           </button>
         </div>
       </form>

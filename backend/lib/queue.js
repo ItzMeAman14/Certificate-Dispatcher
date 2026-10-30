@@ -144,7 +144,8 @@ async function processJob(job) {
     const user = await store.getUser(userId);
     if (!user) throw new Error('User account not found.');
     const s = user.settings || {};
-    const transport = getTransport(user);
+    const isBrevoApi = (s.emailProvider || (s.brevoApiKeyEnc ? 'brevo_api' : 'smtp')) === 'brevo_api';
+    const transport = !isBrevoApi ? getTransport(user) : null;
 
     // 3. Salesforce: verify & download certificate
     const { student, file } = await sf.withSalesforce(user, async (conn) => {
@@ -212,23 +213,80 @@ async function processJob(job) {
     const subjectLine = fillTemplate(job.subject || 'Your certificate', plainVars).replace(/[\r\n]+/g, ' ');
 
     // 6. Send Mail
-    const fromAddress = s.fromEmail || s.smtpUser;
-    const info = await transport.sendMail({
-      from: `"${(s.fromName || fromAddress).replace(/"/g, '')}" <${fromAddress}>`,
-      replyTo: s.replyTo || undefined,
-      to: student.email,
-      cc: s.cc || undefined,
-      subject: subjectLine,
-      html,
-      text: htmlToText(fillTemplate(bodyTemplate, { ...htmlVars, logoSrc: '' })),
-      attachments: [{ filename: file.fileName, content: file.content }],
-      headers: {
-        'X-Certificate-Delivery-Id': deliveryId,
-        'X-Campaign-Id': campaignId || '',
-      },
-    });
+    let providerMessageId = `msg-${Date.now()}`;
+    let responseDetails = 'OK';
 
-    const providerMessageId = (info && (info.messageId || info.response)) || `msg-${Date.now()}`;
+    if (isBrevoApi) {
+      const apiKey = decrypt(s.brevoApiKeyEnc || s.smtpPassEnc);
+      const fromAddress = s.fromEmail || s.smtpUser;
+      const fromName = s.fromName || fromAddress;
+
+      const payload = {
+        sender: { name: fromName, email: fromAddress },
+        to: [{ email: student.email, name: student.name }],
+        subject: subjectLine,
+        htmlContent: html,
+        textContent: htmlToText(fillTemplate(bodyTemplate, { ...htmlVars, logoSrc: '' })),
+        attachment: [
+          {
+            name: file.fileName,
+            content: Buffer.isBuffer(file.content)
+              ? file.content.toString('base64')
+              : Buffer.from(file.content).toString('base64'),
+          },
+        ],
+        headers: {
+          'X-Certificate-Delivery-Id': deliveryId,
+          'X-Campaign-Id': campaignId || '',
+        },
+      };
+
+      if (s.replyTo) {
+        payload.replyTo = { email: s.replyTo };
+      }
+      if (s.cc) {
+        const ccList = s.cc.split(',').map((c) => ({ email: c.trim() })).filter((c) => c.email);
+        if (ccList.length > 0) payload.cc = ccList;
+      }
+
+      const apiRes = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'api-key': apiKey,
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(30_000),
+      });
+
+      const apiData = await apiRes.json().catch(() => null);
+      if (!apiRes.ok) {
+        const errMsg = apiData?.message || `HTTP ${apiRes.status} from Brevo API`;
+        throw new Error(`Brevo API send rejected: ${errMsg}`);
+      }
+
+      providerMessageId = apiData?.messageId || `brevo-${Date.now()}`;
+      responseDetails = 'Accepted by Brevo REST API (HTTPS)';
+    } else {
+      const fromAddress = s.fromEmail || s.smtpUser;
+      const info = await transport.sendMail({
+        from: `"${(s.fromName || fromAddress).replace(/"/g, '')}" <${fromAddress}>`,
+        replyTo: s.replyTo || undefined,
+        to: student.email,
+        cc: s.cc || undefined,
+        subject: subjectLine,
+        html,
+        text: htmlToText(fillTemplate(bodyTemplate, { ...htmlVars, logoSrc: '' })),
+        attachments: [{ filename: file.fileName, content: file.content }],
+        headers: {
+          'X-Certificate-Delivery-Id': deliveryId,
+          'X-Campaign-Id': campaignId || '',
+        },
+      });
+
+      providerMessageId = (info && (info.messageId || info.response)) || `msg-${Date.now()}`;
+      responseDetails = `Accepted by mail server: ${info.response || 'OK'}`;
+    }
 
     // 7. Success state update (Marked as 'sent' / Accepted by provider)
     await store.completeJob(jobId, deliveryId, providerMessageId);
@@ -241,9 +299,9 @@ async function processJob(job) {
       deliveryId,
       userId,
       eventType: 'sent',
-      provider: 'smtp',
+      provider: isBrevoApi ? 'brevo_api' : 'smtp',
       providerEventId: providerMessageId,
-      details: `Accepted by mail server: ${info.response || 'OK'}`,
+      details: responseDetails,
     });
 
     if (campaignId) {

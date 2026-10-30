@@ -35,6 +35,8 @@ export interface PublicSettings {
   collegeField?: string;
   statusField?: string;
   dataSourceSet?: boolean;
+  emailProvider?: 'brevo_api' | 'smtp';
+  hasBrevoApiKey?: boolean;
 }
 
 export interface Me {

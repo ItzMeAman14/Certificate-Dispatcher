@@ -146,6 +146,7 @@ async function assertPublicMailHost(host) {
 function settingsOf(user) {
   const s = user.settings || {};
   return {
+    emailProvider: s.emailProvider || (s.brevoApiKeyEnc ? 'brevo_api' : 'smtp'),
     fromName: s.fromName || '',
     hrName: s.hrName || '',
     smtpUser: s.smtpUser || '',
@@ -168,6 +169,7 @@ function settingsOf(user) {
 const publicSettings = (user) => ({
   ...settingsOf(user),
   hasSmtpPassword: Boolean(user.settings && user.settings.smtpPassEnc),
+  hasBrevoApiKey: Boolean(user.settings && user.settings.brevoApiKeyEnc),
 });
 
 const connectionOf = (user) =>
@@ -175,7 +177,15 @@ const connectionOf = (user) =>
     ? { method: user.connection.method, orgName: user.connection.orgName, instanceUrl: user.connection.instanceUrl }
     : null;
 
-const emailConfigured = (user) => Boolean(user.settings && user.settings.smtpUser && user.settings.smtpPassEnc);
+const emailConfigured = (user) => {
+  const s = user.settings;
+  if (!s) return false;
+  const isBrevo = (s.emailProvider || (s.brevoApiKeyEnc ? 'brevo_api' : 'smtp')) === 'brevo_api';
+  if (isBrevo) {
+    return Boolean(s.brevoApiKeyEnc && (s.fromEmail || s.smtpUser));
+  }
+  return Boolean(user.settings && user.settings.smtpUser && user.settings.smtpPassEnc);
+};
 
 const meResponse = (user) => ({
   success: true,
@@ -427,11 +437,16 @@ app.put('/api/settings', requireAuth, wrap(async (req, res) => {
   const prev = settingsOf(req.user);
   const existing = req.user.settings || {};
 
+  const emailProvider = b.emailProvider === 'brevo_api' ? 'brevo_api' : 'smtp';
+  const newBrevoKey = String(b.brevoApiKey || '').trim();
+  const brevoApiKeyEnc = newBrevoKey ? encrypt(newBrevoKey) : existing.brevoApiKeyEnc;
+
   const next = {
     ...existing,
+    emailProvider,
     fromName: text(b.fromName, 'Display name', { max: 80 }),
     hrName: text(b.hrName, 'Sender name', { max: 80 }),
-    smtpUser: text(b.smtpUser, 'Sender email', { max: 200 }).toLowerCase(),
+    smtpUser: text(b.smtpUser || '', 'Sender email', { max: 200 }).toLowerCase(),
     fromEmail: b.fromEmail ? text(b.fromEmail, 'From email', { max: 200 }).toLowerCase() : '',
     dailyLimit: Math.max(0, Number(b.dailyLimit || 0)),
     smtpHost: text(b.smtpHost || 'smtp.gmail.com', 'Mail server', { max: 100 }).toLowerCase(),
@@ -442,8 +457,6 @@ app.put('/api/settings', requireAuth, wrap(async (req, res) => {
   };
 
   if (next.fromEmail && !EMAIL_RE.test(next.fromEmail)) throw new HttpError(400, 'From email is not valid.');
-  if (next.smtpUser && !EMAIL_RE.test(next.smtpUser)) throw new HttpError(400, 'Sender email is not valid.');
-  if (!SMTP_PORTS.includes(next.smtpPort)) throw new HttpError(400, `Mail port must be one of ${SMTP_PORTS.join(', ')}.`);
   if (next.replyTo && !EMAIL_RE.test(next.replyTo)) throw new HttpError(400, 'Reply-to email is not valid.');
   if (next.cc && !next.cc.split(',').every((e) => EMAIL_RE.test(e.trim()))) {
     throw new HttpError(400, 'CC must be one or more valid emails separated by commas.');
@@ -455,19 +468,52 @@ app.put('/api/settings', requireAuth, wrap(async (req, res) => {
   const newPassword = String(b.smtpPassword || '').replace(/\s+/g, '');
   const smtpPassEnc = newPassword ? encrypt(newPassword) : existing.smtpPassEnc;
   next.smtpPassEnc = smtpPassEnc;
+  next.brevoApiKeyEnc = brevoApiKeyEnc;
 
-  const mailChanged =
-    Boolean(newPassword) ||
-    next.smtpUser !== prev.smtpUser || next.smtpHost !== prev.smtpHost || next.smtpPort !== prev.smtpPort;
-  if (next.smtpUser && smtpPassEnc && mailChanged) {
-    await assertPublicMailHost(next.smtpHost);
-    const probe = makeTransport(next, newPassword || decrypt(smtpPassEnc), false);
-    try {
-      await probe.verify();
-    } catch (err) {
-      throw new HttpError(400, `Could not sign in to the mail server: ${err.message}`);
-    } finally {
-      probe.close();
+  if (emailProvider === 'brevo_api') {
+    const activeSender = next.fromEmail || next.smtpUser;
+    if (!activeSender || !EMAIL_RE.test(activeSender)) {
+      throw new HttpError(400, 'A valid verified sender email is required for Brevo API.');
+    }
+    const rawKey = newBrevoKey || (brevoApiKeyEnc ? decrypt(brevoApiKeyEnc) : '');
+    if (!rawKey) {
+      throw new HttpError(400, 'Brevo API Key is required (starts with xkeysib-...).');
+    }
+
+    // Verify Brevo API key via HTTPS Port 443 (Never blocked by Render!)
+    if (newBrevoKey || emailProvider !== prev.emailProvider) {
+      try {
+        const verifyRes = await fetch('https://api.brevo.com/v3/account', {
+          headers: { 'api-key': rawKey },
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!verifyRes.ok) {
+          const body = await verifyRes.json().catch(() => null);
+          const reason = body?.message || `HTTP ${verifyRes.status}`;
+          throw new HttpError(400, `Brevo rejected the API key: ${reason}`);
+        }
+      } catch (err) {
+        if (err instanceof HttpError) throw err;
+        throw new HttpError(400, `Could not connect to Brevo API: ${err.message}`);
+      }
+    }
+  } else {
+    if (next.smtpUser && !EMAIL_RE.test(next.smtpUser)) throw new HttpError(400, 'Sender email is not valid.');
+    if (!SMTP_PORTS.includes(next.smtpPort)) throw new HttpError(400, `Mail port must be one of ${SMTP_PORTS.join(', ')}.`);
+
+    const mailChanged =
+      Boolean(newPassword) ||
+      next.smtpUser !== prev.smtpUser || next.smtpHost !== prev.smtpHost || next.smtpPort !== prev.smtpPort;
+    if (next.smtpUser && smtpPassEnc && mailChanged) {
+      await assertPublicMailHost(next.smtpHost);
+      const probe = makeTransport(next, newPassword || decrypt(smtpPassEnc), false);
+      try {
+        await probe.verify();
+      } catch (err) {
+        throw new HttpError(400, `Could not sign in to the mail server: ${err.message}`);
+      } finally {
+        probe.close();
+      }
     }
   }
 
