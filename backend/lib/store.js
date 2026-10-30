@@ -13,6 +13,7 @@
 const fs = require('fs');
 const path = require('path');
 const { DATA_DIR, randomToken, sha256 } = require('../security');
+const { HttpError } = require('./errors');
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const usePg = Boolean(DATABASE_URL);
@@ -48,7 +49,22 @@ async function initPostgres() {
     const client = await pool.connect();
     try {
       await client.query(`
-        -- Users
+        -- Users table (Requirement 5)
+        CREATE TABLE IF NOT EXISTS users (
+          id TEXT PRIMARY KEY,
+          email TEXT UNIQUE NOT NULL,
+          data JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+
+        -- Sessions table (Requirement 5)
+        CREATE TABLE IF NOT EXISTS sessions (
+          token_hash TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          expires_at BIGINT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+
+        -- Users (legacy cd_users)
         CREATE TABLE IF NOT EXISTS cd_users (
           id VARCHAR(64) PRIMARY KEY,
           email VARCHAR(255) UNIQUE NOT NULL,
@@ -167,11 +183,35 @@ async function initPostgres() {
         CREATE INDEX IF NOT EXISTS idx_cd_suppressions_email ON cd_suppressions(user_id, email);
       `);
 
-      // Auto-migrate local store.json if database is new
-      const { rows } = await client.query('SELECT COUNT(*) AS count FROM cd_users');
-      if (Number(rows[0].count) === 0) {
-        await migrateFromFileToPg(client);
-      }
+      // Sync users from cd_users to users table if needed
+      await client.query(`
+        INSERT INTO users (id, email, data)
+        SELECT id, LOWER(email), jsonb_build_object(
+          'name', COALESCE(name, ''),
+          'passwordHash', password_hash,
+          'createdAt', created_at,
+          'connection', connection,
+          'settings', COALESCE(settings, '{}'::jsonb),
+          'template', template,
+          'sent', '{}'::jsonb,
+          'sendLog', '[]'::jsonb
+        )
+        FROM cd_users
+        ON CONFLICT (id) DO NOTHING
+      `).catch(() => {});
+
+      // Requirement 1: On server startup, set connection = null for any stored user whose method was "password"
+      await client.query(`
+        UPDATE users
+        SET data = jsonb_set(data, '{connection}', 'null'::jsonb)
+        WHERE (data->'connection'->>'method') = 'password'
+      `).catch(() => {});
+
+      await client.query(`
+        UPDATE cd_users
+        SET connection = null
+        WHERE (connection->>'method') = 'password'
+      `).catch(() => {});
 
       console.log('PostgreSQL schema verified and ready.');
     } finally {
@@ -216,15 +256,18 @@ async function migrateFromFileToPg(client) {
 
 function rowToUser(row) {
   if (!row) return null;
+  const d = row.data && typeof row.data === 'object' ? row.data : row;
   return {
     id: row.id,
     email: row.email,
-    name: row.name || '',
-    passwordHash: row.password_hash,
-    createdAt: Number(row.created_at),
-    connection: row.connection || null,
-    settings: row.settings || {},
-    template: row.template || null,
+    name: d.name || '',
+    passwordHash: d.passwordHash || d.password_hash || '',
+    createdAt: Number(d.createdAt || d.created_at || Date.now()),
+    connection: d.connection || null,
+    settings: d.settings || {},
+    template: d.template || null,
+    sent: d.sent || {},
+    sendLog: Array.isArray(d.sendLog) ? d.sendLog : (Array.isArray(d.send_log) ? d.send_log : []),
   };
 }
 
@@ -305,6 +348,17 @@ function loadFileDb() {
   fileDb.events ||= {};
   fileDb.jobs ||= {};
   fileDb.suppressions ||= {};
+
+  let modified = false;
+  for (const u of Object.values(fileDb.users)) {
+    if (u.connection && u.connection.method === 'password') {
+      u.connection = null;
+      modified = true;
+    }
+    if (!u.sent) u.sent = {};
+    if (!Array.isArray(u.sendLog)) u.sendLog = [];
+  }
+  if (modified) persistFileDb();
 }
 
 function persistFileDb() {
@@ -325,8 +379,10 @@ if (!usePg) {
 async function getUser(id) {
   if (usePg) {
     await initPromise;
-    const res = await pool.query('SELECT * FROM cd_users WHERE id = $1', [id]);
-    return rowToUser(res.rows[0]);
+    const res = await pool.query('SELECT id, email, data FROM users WHERE id = $1', [id]);
+    if (res.rows[0]) return rowToUser(res.rows[0]);
+    const legacy = await pool.query('SELECT * FROM cd_users WHERE id = $1', [id]).catch(() => ({ rows: [] }));
+    return rowToUser(legacy.rows[0]);
   }
   return fileDb.users[id] || null;
 }
@@ -336,35 +392,53 @@ async function findUserByEmail(email) {
   const lower = String(email).trim().toLowerCase();
   if (usePg) {
     await initPromise;
-    const res = await pool.query('SELECT * FROM cd_users WHERE LOWER(email) = $1', [lower]);
-    return rowToUser(res.rows[0]);
+    const res = await pool.query('SELECT id, email, data FROM users WHERE LOWER(email) = $1', [lower]);
+    if (res.rows[0]) return rowToUser(res.rows[0]);
+    const legacy = await pool.query('SELECT * FROM cd_users WHERE LOWER(email) = $1', [lower]).catch(() => ({ rows: [] }));
+    return rowToUser(legacy.rows[0]);
   }
   return Object.values(fileDb.users).find((u) => u.email.toLowerCase() === lower) || null;
 }
 
 async function createUser({ email, name, passwordHash }) {
-  const user = {
-    id: randomToken(12),
-    email: String(email).trim().toLowerCase(),
+  const id = randomToken(12);
+  const cleanEmail = String(email).trim().toLowerCase();
+  const now = Date.now();
+  const data = {
     name: name || '',
     passwordHash,
-    createdAt: Date.now(),
+    createdAt: now,
     connection: null,
-    settings: {},
+    settings: {
+      smtpHost: 'smtp.gmail.com',
+      smtpPort: 465,
+      fromName: name || '',
+      hrName: name || '',
+      dailyLimit: 0,
+      fromEmail: '',
+    },
     template: null,
+    sent: {},
+    sendLog: [],
   };
 
   if (usePg) {
     await initPromise;
     await pool.query(
-      `INSERT INTO cd_users (id, email, name, password_hash, created_at, connection, settings, template)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [user.id, user.email, user.name, user.passwordHash, user.createdAt, null, JSON.stringify(user.settings), null]
+      'INSERT INTO users (id, email, data) VALUES ($1, $2, $3)',
+      [id, cleanEmail, JSON.stringify(data)]
     );
-    return user;
+    await pool.query(
+      `INSERT INTO cd_users (id, email, name, password_hash, created_at, connection, settings, template)
+       VALUES ($1, $2, $3, $4, $5, null, $6, null)
+       ON CONFLICT (id) DO NOTHING`,
+      [id, cleanEmail, data.name, data.passwordHash, now, JSON.stringify(data.settings)]
+    ).catch(() => {});
+    return { id, email: cleanEmail, ...data };
   }
 
-  fileDb.users[user.id] = user;
+  const user = { id, email: cleanEmail, ...data };
+  fileDb.users[id] = user;
   persistFileDb();
   return user;
 }
@@ -372,24 +446,42 @@ async function createUser({ email, name, passwordHash }) {
 async function updateUser(id, patch) {
   if (usePg) {
     await initPromise;
-    const current = await getUser(id);
-    if (!current) return null;
-    const updated = { ...current, ...patch };
+    const user = await getUser(id);
+    if (!user) return null;
+
+    const newEmail = patch.email ? String(patch.email).trim().toLowerCase() : user.email;
+    const data = {
+      name: patch.name !== undefined ? patch.name : user.name,
+      passwordHash: patch.passwordHash !== undefined ? patch.passwordHash : user.passwordHash,
+      createdAt: user.createdAt,
+      connection: patch.connection !== undefined ? patch.connection : user.connection,
+      settings: patch.settings !== undefined ? patch.settings : user.settings,
+      template: patch.template !== undefined ? patch.template : user.template,
+      sent: patch.sent !== undefined ? patch.sent : user.sent,
+      sendLog: patch.sendLog !== undefined ? patch.sendLog : user.sendLog,
+    };
+
+    await pool.query(
+      'UPDATE users SET email = $1, data = $2 WHERE id = $3',
+      [newEmail, JSON.stringify(data), id]
+    );
+
     await pool.query(
       `UPDATE cd_users
        SET email = $1, name = $2, password_hash = $3, connection = $4, settings = $5, template = $6
        WHERE id = $7`,
       [
-        updated.email,
-        updated.name,
-        updated.passwordHash,
-        updated.connection ? JSON.stringify(updated.connection) : null,
-        updated.settings ? JSON.stringify(updated.settings) : JSON.stringify({}),
-        updated.template ? JSON.stringify(updated.template) : null,
+        newEmail,
+        data.name,
+        data.passwordHash,
+        data.connection ? JSON.stringify(data.connection) : null,
+        JSON.stringify(data.settings || {}),
+        data.template ? JSON.stringify(data.template) : null,
         id,
       ]
-    );
-    return updated;
+    ).catch(() => {});
+
+    return { id, email: newEmail, ...data };
   }
 
   const user = fileDb.users[id];
@@ -411,11 +503,17 @@ async function createSession(userId, ttlMs) {
   if (usePg) {
     await initPromise;
     await pool.query(
-      `INSERT INTO cd_sessions (token_hash, user_id, expires_at)
+      `INSERT INTO sessions (token_hash, user_id, expires_at)
        VALUES ($1, $2, $3)
        ON CONFLICT (token_hash) DO UPDATE SET expires_at = $3`,
       [tokenHash, userId, expiresAt]
     );
+    await pool.query(
+      `INSERT INTO cd_sessions (token_hash, user_id, expires_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (token_hash) DO UPDATE SET expires_at = $3`,
+      [tokenHash, userId, expiresAt]
+    ).catch(() => {});
     return token;
   }
 
@@ -427,12 +525,21 @@ async function createSession(userId, ttlMs) {
 async function getSession(tokenHash) {
   if (usePg) {
     await initPromise;
-    const res = await pool.query('SELECT user_id, expires_at FROM cd_sessions WHERE token_hash = $1', [tokenHash]);
-    if (!res.rows[0]) return null;
-    return {
-      userId: res.rows[0].user_id,
-      expiresAt: Number(res.rows[0].expires_at),
-    };
+    const res = await pool.query('SELECT user_id, expires_at FROM sessions WHERE token_hash = $1', [tokenHash]);
+    if (res.rows[0]) {
+      return {
+        userId: res.rows[0].user_id,
+        expiresAt: Number(res.rows[0].expires_at),
+      };
+    }
+    const legacy = await pool.query('SELECT user_id, expires_at FROM cd_sessions WHERE token_hash = $1', [tokenHash]).catch(() => ({ rows: [] }));
+    if (legacy.rows[0]) {
+      return {
+        userId: legacy.rows[0].user_id,
+        expiresAt: Number(legacy.rows[0].expires_at),
+      };
+    }
+    return null;
   }
   return fileDb.sessions[tokenHash] || null;
 }
@@ -440,7 +547,8 @@ async function getSession(tokenHash) {
 async function deleteSession(tokenHash) {
   if (usePg) {
     await initPromise;
-    await pool.query('DELETE FROM cd_sessions WHERE token_hash = $1', [tokenHash]);
+    await pool.query('DELETE FROM sessions WHERE token_hash = $1', [tokenHash]);
+    await pool.query('DELETE FROM cd_sessions WHERE token_hash = $1', [tokenHash]).catch(() => {});
     return;
   }
   if (fileDb.sessions[tokenHash]) {
@@ -454,7 +562,8 @@ async function pruneSessions() {
   if (usePg) {
     try {
       await initPromise;
-      await pool.query('DELETE FROM cd_sessions WHERE expires_at < $1', [now]);
+      await pool.query('DELETE FROM sessions WHERE expires_at < $1', [now]);
+      await pool.query('DELETE FROM cd_sessions WHERE expires_at < $1', [now]).catch(() => {});
     } catch (err) {
       console.error('Failed to prune sessions in database:', err.message);
     }
@@ -469,6 +578,66 @@ async function pruneSessions() {
     }
   }
   if (changed) persistFileDb();
+}
+
+/* -------------------------------------------------------------------------- */
+/*                        Sent History & Quota Tracking                       */
+/* -------------------------------------------------------------------------- */
+
+const inFlightSends = new Map(); // userId -> number
+
+async function recordSent(userId, studentId, { at = Date.now(), to = '', file = '' } = {}) {
+  const user = await getUser(userId);
+  if (!user) return null;
+
+  const sent = { ...(user.sent || {}) };
+  sent[studentId] = { at, to: String(to || ''), file: String(file || '') };
+
+  const twoDaysAgo = Date.now() - 48 * 60 * 60 * 1000;
+  const sendLog = [...(user.sendLog || []), at].filter((t) => typeof t === 'number' && t > twoDaysAgo);
+
+  return await updateUser(userId, { sent, sendLog });
+}
+
+function getQuota(user) {
+  if (!user) return { limit: 0, used: 0, resetsAt: null };
+  const limit = Math.max(0, Number(user.settings?.dailyLimit || 0));
+  const rolling24h = Date.now() - 24 * 60 * 60 * 1000;
+  const sendLog = Array.isArray(user.sendLog) ? user.sendLog : [];
+  const validLogs = sendLog.filter((t) => typeof t === 'number' && t > rolling24h);
+  const usedCount = validLogs.length;
+  const inFlightCount = inFlightSends.get(user.id) || 0;
+  const resetsAt = validLogs.length > 0 ? validLogs[0] + 24 * 60 * 60 * 1000 : null;
+  return {
+    limit,
+    used: usedCount + inFlightCount,
+    resetsAt,
+  };
+}
+
+async function reserveSend(userId, count = 1) {
+  const user = await getUser(userId);
+  if (!user) throw new HttpError(404, 'User not found');
+  const limit = Math.max(0, Number(user.settings?.dailyLimit || 0));
+  if (limit > 0) {
+    const q = getQuota(user);
+    if (q.used + count > limit) {
+      throw new HttpError(
+        429,
+        `Daily email limit of ${limit} reached (${q.used} sent or in-flight in last 24h).`,
+        'DAILY_LIMIT'
+      );
+    }
+  }
+  inFlightSends.set(userId, (inFlightSends.get(userId) || 0) + count);
+  return true;
+}
+
+function releaseSend(userId, count = 1) {
+  const cur = inFlightSends.get(userId) || 0;
+  const next = Math.max(0, cur - count);
+  if (next <= 0) inFlightSends.delete(userId);
+  else inFlightSends.set(userId, next);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1425,4 +1594,8 @@ module.exports = {
   getDeliveryEvents,
   isSuppressed,
   addSuppression,
+  recordSent,
+  getQuota,
+  reserveSend,
+  releaseSend,
 };

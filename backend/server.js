@@ -2,6 +2,17 @@
 
 require('dotenv').config();
 
+if (process.env.NODE_ENV === 'production') {
+  if (!process.env.APP_ENCRYPTION_KEY) {
+    console.error('FATAL: APP_ENCRYPTION_KEY is required in production.');
+    process.exit(1);
+  }
+  if (!process.env.DATABASE_URL) {
+    console.error('FATAL: DATABASE_URL is required in production.');
+    process.exit(1);
+  }
+}
+
 const dns = require('dns').promises;
 const net = require('net');
 const express = require('express');
@@ -33,6 +44,7 @@ const PORT = Number(process.env.PORT || 3000);
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'http://localhost:5173';
 const ALLOW_SIGNUP = (process.env.ALLOW_SIGNUP || 'true') !== 'false';
 const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true'; // set true when served over HTTPS
+const COOKIE_SAMESITE = (process.env.COOKIE_SAMESITE || 'lax').toLowerCase();
 const SESSION_MS = Number(process.env.SESSION_DAYS || 7) * 24 * 60 * 60 * 1000;
 const COOKIE_NAME = 'cd_session';
 
@@ -64,13 +76,10 @@ function parseCookies(header = '') {
 }
 
 function setSessionCookie(res, token, maxAgeMs) {
-  const isProd =
-    process.env.NODE_ENV === 'production' ||
-    Boolean(process.env.RENDER) ||
-    COOKIE_SECURE;
-  const sameSite = isProd ? 'SameSite=None' : 'SameSite=Lax';
-  const flags = ['HttpOnly', 'Path=/', sameSite, `Max-Age=${Math.floor(maxAgeMs / 1000)}`];
-  if (isProd) flags.push('Secure');
+  const isSecure = COOKIE_SECURE || COOKIE_SAMESITE === 'none';
+  const sameSiteValue = COOKIE_SAMESITE === 'none' ? 'None' : (COOKIE_SAMESITE === 'strict' ? 'Strict' : 'Lax');
+  const flags = ['HttpOnly', 'Path=/', `SameSite=${sameSiteValue}`, `Max-Age=${Math.floor(maxAgeMs / 1000)}`];
+  if (isSecure) flags.push('Secure');
   res.setHeader('Set-Cookie', `${COOKIE_NAME}=${token}; ${flags.join('; ')}`);
 }
 
@@ -140,13 +149,19 @@ function settingsOf(user) {
     fromName: s.fromName || '',
     hrName: s.hrName || '',
     smtpUser: s.smtpUser || '',
+    fromEmail: s.fromEmail || '',
+    dailyLimit: Math.max(0, Number(s.dailyLimit || 0)),
     smtpHost: s.smtpHost || 'smtp.gmail.com',
     smtpPort: s.smtpPort || 465,
     cc: s.cc || '',
     replyTo: s.replyTo || '',
     logoUrl: s.logoUrl || '',
-    studentObject: s.studentObject || 'Student__c',
-    emailField: s.emailField || 'Email__c',
+    studentObject: s.studentObject || '',
+    nameField: s.nameField || '',
+    emailField: s.emailField || '',
+    collegeField: s.collegeField || '',
+    statusField: s.statusField || '',
+    dataSourceSet: Boolean(s.dataSourceSet),
   };
 }
 
@@ -168,6 +183,7 @@ const meResponse = (user) => ({
   connection: connectionOf(user),
   emailConfigured: emailConfigured(user),
   settings: publicSettings(user),
+  quota: store.getQuota(user),
 });
 
 /* -------------------------------------------------------------------------- */
@@ -412,18 +428,20 @@ app.put('/api/settings', requireAuth, wrap(async (req, res) => {
   const existing = req.user.settings || {};
 
   const next = {
+    ...existing,
     fromName: text(b.fromName, 'Display name', { max: 80 }),
     hrName: text(b.hrName, 'Sender name', { max: 80 }),
     smtpUser: text(b.smtpUser, 'Sender email', { max: 200 }).toLowerCase(),
+    fromEmail: b.fromEmail ? text(b.fromEmail, 'From email', { max: 200 }).toLowerCase() : '',
+    dailyLimit: Math.max(0, Number(b.dailyLimit || 0)),
     smtpHost: text(b.smtpHost || 'smtp.gmail.com', 'Mail server', { max: 100 }).toLowerCase(),
     smtpPort: Number(b.smtpPort || 465),
     cc: text(b.cc, 'CC', { max: 300 }),
     replyTo: text(b.replyTo, 'Reply-to', { max: 200 }),
     logoUrl: text(b.logoUrl, 'Logo URL', { max: 500 }),
-    studentObject: text(b.studentObject || 'Student__c', 'Student object', { max: 61 }),
-    emailField: text(b.emailField || 'Email__c', 'Email field', { max: 61 }),
   };
 
+  if (next.fromEmail && !EMAIL_RE.test(next.fromEmail)) throw new HttpError(400, 'From email is not valid.');
   if (next.smtpUser && !EMAIL_RE.test(next.smtpUser)) throw new HttpError(400, 'Sender email is not valid.');
   if (!SMTP_PORTS.includes(next.smtpPort)) throw new HttpError(400, `Mail port must be one of ${SMTP_PORTS.join(', ')}.`);
   if (next.replyTo && !EMAIL_RE.test(next.replyTo)) throw new HttpError(400, 'Reply-to email is not valid.');
@@ -433,11 +451,10 @@ app.put('/api/settings', requireAuth, wrap(async (req, res) => {
   if (next.logoUrl && !/^https:\/\/[^\s"'<>]+$/i.test(next.logoUrl)) {
     throw new HttpError(400, 'Logo URL must start with https://');
   }
-  if (!sf.IDENT_RE.test(next.studentObject)) throw new HttpError(400, 'Student object must be an API name like Student__c.');
-  if (!sf.IDENT_RE.test(next.emailField)) throw new HttpError(400, 'Email field must be an API name like Email__c.');
 
   const newPassword = String(b.smtpPassword || '').replace(/\s+/g, '');
   const smtpPassEnc = newPassword ? encrypt(newPassword) : existing.smtpPassEnc;
+  next.smtpPassEnc = smtpPassEnc;
 
   const mailChanged =
     Boolean(newPassword) ||
@@ -454,9 +471,94 @@ app.put('/api/settings', requireAuth, wrap(async (req, res) => {
     }
   }
 
-  const updated = await store.updateUser(req.user.id, { settings: { ...next, smtpPassEnc } });
+  const updated = await store.updateUser(req.user.id, { settings: next });
   if (updated) req.user = updated;
-  res.json({ success: true, settings: publicSettings(req.user), emailConfigured: emailConfigured(req.user) });
+  res.json({
+    success: true,
+    settings: publicSettings(req.user),
+    emailConfigured: emailConfigured(req.user),
+    quota: store.getQuota(req.user),
+  });
+}));
+
+/* -------------------------------------------------------------------------- */
+/*                               Data Source Picker                           */
+/* -------------------------------------------------------------------------- */
+
+app.get('/api/salesforce/objects', requireAuth, wrap(async (req, res) => {
+  const objects = await sf.withSalesforce(req.user, (conn) => sf.describeObjects(conn));
+  res.json({ success: true, objects });
+}));
+
+app.get('/api/salesforce/fields', requireAuth, wrap(async (req, res) => {
+  const objectName = text(req.query.object, 'Object name', { max: 61, required: true });
+  const result = await sf.withSalesforce(req.user, (conn) => sf.describeFields(conn, objectName));
+  res.json({ success: true, ...result });
+}));
+
+app.put('/api/datasource', requireAuth, wrap(async (req, res) => {
+  const b = req.body || {};
+  const studentObject = text(b.studentObject, 'Student object', { max: 61, required: true });
+  const nameField = text(b.nameField, 'Name field', { max: 61, required: true });
+  const emailField = text(b.emailField, 'Email field', { max: 61, required: true });
+  const collegeField = b.collegeField ? text(b.collegeField, 'College field', { max: 61 }) : null;
+  const statusField = b.statusField ? text(b.statusField, 'Status field', { max: 61 }) : null;
+
+  if (!sf.IDENT_RE.test(studentObject)) throw new HttpError(400, 'Student object must be a valid API name.');
+  if (!sf.IDENT_RE.test(nameField)) throw new HttpError(400, 'Name field must be a valid API name.');
+  if (!sf.IDENT_RE.test(emailField)) throw new HttpError(400, 'Email field must be a valid API name.');
+  if (collegeField && !sf.IDENT_RE.test(collegeField)) throw new HttpError(400, 'College field must be a valid API name.');
+  if (statusField && !sf.IDENT_RE.test(statusField)) throw new HttpError(400, 'Status field must be a valid API name.');
+
+  // Validate against Salesforce: confirm object supports files and fields exist
+  const meta = await sf.withSalesforce(req.user, async (conn) => {
+    return await sf.describeFields(conn, studentObject);
+  });
+
+  if (!meta.supportsFiles) {
+    throw new HttpError(
+      400,
+      `Object ${studentObject} does not support file attachments (no ContentDocumentLinks relationship).`
+    );
+  }
+
+  const findField = (name) => meta.fields.find((f) => f.name.toLowerCase() === name.toLowerCase());
+
+  const canonicalNameObj = findField(nameField);
+  if (!canonicalNameObj) throw new HttpError(400, `Field "${nameField}" does not exist on ${studentObject}.`);
+
+  const canonicalEmailObj = findField(emailField);
+  if (!canonicalEmailObj) throw new HttpError(400, `Field "${emailField}" does not exist on ${studentObject}.`);
+
+  let canonicalCollege = null;
+  if (collegeField) {
+    const f = findField(collegeField);
+    if (!f) throw new HttpError(400, `Field "${collegeField}" does not exist on ${studentObject}.`);
+    canonicalCollege = f.name;
+  }
+
+  let canonicalStatus = null;
+  if (statusField) {
+    const f = findField(statusField);
+    if (!f) throw new HttpError(400, `Field "${statusField}" does not exist on ${studentObject}.`);
+    canonicalStatus = f.name;
+  }
+
+  const existingSettings = req.user.settings || {};
+  const nextSettings = {
+    ...existingSettings,
+    studentObject,
+    nameField: canonicalNameObj.name,
+    emailField: canonicalEmailObj.name,
+    collegeField: canonicalCollege,
+    statusField: canonicalStatus,
+    dataSourceSet: true,
+  };
+
+  const updated = await store.updateUser(req.user.id, { settings: nextSettings });
+  if (updated) req.user = updated;
+
+  res.json({ success: true, settings: publicSettings(req.user) });
 }));
 
 app.get('/api/template', requireAuth, (req, res) => res.json({ success: true, template: req.user.template }));
@@ -478,27 +580,48 @@ app.put('/api/template', requireAuth, wrap(async (req, res) => {
 /* -------------------------------------------------------------------------- */
 
 app.get('/api/students', requireAuth, wrap(async (req, res) => {
-  const { studentObject, emailField } = settingsOf(req.user);
+  const s = req.user.settings || {};
+  if (!s.dataSourceSet || !s.studentObject || !s.emailField) {
+    throw new HttpError(409, 'Please select a data source first.', 'NO_DATASOURCE');
+  }
 
-  const records = await sf.withSalesforce(req.user, (conn) =>
-    sf.queryAll(
-      conn,
-      `SELECT Id, Name, ${emailField},
-         (SELECT ContentDocumentId, ContentDocument.Title, ContentDocument.FileExtension
-          FROM ContentDocumentLinks)
-       FROM ${studentObject}
-       WHERE ${emailField} != null
-       ORDER BY Name`,
-    ),
-  );
+  const studentObject = s.studentObject;
+  const nameField = s.nameField || 'Name';
+  const emailField = s.emailField;
+  const collegeField = s.collegeField || null;
+  const statusField = s.statusField || null;
 
-  const data = records.map((r) => ({
-    Id: r.Id,
-    Name: r.Name,
-    Email__c: r[emailField],
-    ContentDocumentLinks: r.ContentDocumentLinks,
-  }));
-  res.json({ success: true, data });
+  // Dedupe columns in SOQL
+  const fields = ['Id'];
+  if (!fields.includes(nameField)) fields.push(nameField);
+  if (!fields.includes(emailField)) fields.push(emailField);
+  if (collegeField && !fields.includes(collegeField)) fields.push(collegeField);
+  if (statusField && !fields.includes(statusField)) fields.push(statusField);
+
+  const subQuery = `(SELECT ContentDocumentId, ContentDocument.Title, ContentDocument.FileExtension FROM ContentDocumentLinks)`;
+  const selectClause = `${fields.join(', ')}, ${subQuery}`;
+  const soql = `SELECT ${selectClause} FROM ${studentObject} WHERE ${emailField} != null ORDER BY ${nameField}`;
+
+  const records = await sf.withSalesforce(req.user, (conn) => sf.queryAll(conn, soql));
+
+  const sentMap = req.user.sent || {};
+  const data = records.map((r) => {
+    const studentId = r.Id;
+    const sentRecord = sentMap[studentId];
+    return {
+      Id: studentId,
+      Name: r[nameField] || '',
+      Email__c: r[emailField] || '',
+      College: collegeField ? (r[collegeField] || '') : '',
+      Status: statusField ? (r[statusField] || '') : '',
+      SentAt: sentRecord ? sentRecord.at : null,
+      ContentDocumentLinks: r.ContentDocumentLinks,
+    };
+  });
+
+  const quota = store.getQuota(req.user);
+
+  res.json({ success: true, data, quota });
 }));
 
 /* -------------------------------------------------------------------------- */
@@ -562,6 +685,29 @@ app.post('/api/campaigns/queue', requireAuth, wrap(async (req, res) => {
     throw new HttpError(409, 'Please configure your sender email in Settings first.', 'NO_EMAIL_SETTINGS');
   }
 
+  // Quota calculation
+  const quota = store.getQuota(req.user);
+  let toSend = items;
+  let leftForLater = 0;
+
+  if (quota.limit > 0) {
+    const remaining = Math.max(0, quota.limit - quota.used);
+    if (remaining <= 0) {
+      throw new HttpError(
+        429,
+        `Daily email limit reached (${quota.used}/${quota.limit}).`,
+        'DAILY_LIMIT'
+      );
+    }
+    if (items.length > remaining) {
+      toSend = items.slice(0, remaining);
+      leftForLater = items.length - remaining;
+    }
+  }
+
+  // Reserve send quota for items actually being sent
+  await store.reserveSend(req.user.id, toSend.length);
+
   const campaignSubject = text(subject || 'Your Certificate', 'Subject', { max: 300, required: true });
   const campaignName = text(name || `Dispatch ${new Date().toLocaleDateString()}`, 'Campaign Name', { max: 100 });
 
@@ -571,11 +717,11 @@ app.post('/api/campaigns/queue', requireAuth, wrap(async (req, res) => {
     name: campaignName,
     subject: campaignSubject,
     templateHtml: typeof htmlTemplate === 'string' ? htmlTemplate : '',
-    totalRecipients: items.length,
+    totalRecipients: toSend.length,
   });
 
   // 2. Prepare items with idempotency
-  const validItems = items.map((it) => ({
+  const validItems = toSend.map((it) => ({
     studentId: String(it.studentId || ''),
     studentName: String(it.studentName || ''),
     recipientEmail: String(it.recipientEmail || it.studentEmail || '').trim().toLowerCase(),
@@ -592,11 +738,18 @@ app.post('/api/campaigns/queue', requireAuth, wrap(async (req, res) => {
     subject: campaignSubject,
   });
 
+  const freshUser = await store.getUser(req.user.id);
+  const updatedQuota = store.getQuota(freshUser);
+
   res.json({
     success: true,
     campaignId: campaign.id,
     queuedCount: validItems.length,
-    message: `Successfully queued ${validItems.length} certificate(s) for background dispatch.`,
+    leftForLater,
+    quota: updatedQuota,
+    message: leftForLater > 0
+      ? `Queued ${validItems.length} certificate(s). ${leftForLater} left for later due to daily limit.`
+      : `Successfully queued ${validItems.length} certificate(s) for background dispatch.`,
   });
 }));
 
@@ -645,6 +798,9 @@ app.post('/api/send-email', requireAuth, wrap(async (req, res) => {
     throw new HttpError(409, 'Set up your sender email in Settings first.', 'NO_EMAIL_SETTINGS');
   }
 
+  // Check quota & reserve 1 send
+  await store.reserveSend(user.id, 1);
+
   // Queue as an individual job for consistent tracking & outbox reliability
   const idempotencyKey = `single_${studentId}_${Date.now()}`;
   const { deliveries } = await store.createDeliveriesAndJobsAtomic({
@@ -662,9 +818,13 @@ app.post('/api/send-email', requireAuth, wrap(async (req, res) => {
     subject: subject || 'Your certificate',
   });
 
+  const freshUser = await store.getUser(user.id);
+  const quota = store.getQuota(freshUser);
+
   res.json({
     success: true,
     deliveryId: deliveries[0]?.id,
+    quota,
     message: `Certificate email queued for ${studentEmail}`,
   });
 }));

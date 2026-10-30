@@ -3,7 +3,7 @@ const rawApiBase: string =
   (import.meta.env.VITE_API_URL as string | undefined) ?? 'http://localhost:3000';
 export const API_BASE: string = rawApiBase.replace(/\/+$/, '');
 
-export type ConnectMethod = 'client_credentials' | 'access_token' | 'password';
+export type ConnectMethod = 'client_credentials' | 'access_token';
 
 export interface ConnectionInfo {
   method: ConnectMethod;
@@ -11,18 +11,26 @@ export interface ConnectionInfo {
   instanceUrl: string;
 }
 
+export interface QuotaInfo {
+  limit: number;
+  used: number;
+  resetsAt: number | null;
+}
+
 export interface PublicSettings {
   fromName: string;
   hrName: string;
   smtpUser: string;
+  fromEmail: string;
+  dailyLimit: number;
   smtpHost: string;
   smtpPort: number;
   hasSmtpPassword: boolean;
   cc: string;
   replyTo: string;
   logoUrl: string;
-  studentObject: string;
-  emailField: string;
+  studentObject?: string;
+  emailField?: string;
   nameField?: string;
   collegeField?: string;
   statusField?: string;
@@ -34,6 +42,48 @@ export interface Me {
   connection: ConnectionInfo | null;
   emailConfigured: boolean;
   settings: PublicSettings;
+  quota?: QuotaInfo;
+}
+
+export interface SalesforceObject {
+  name: string;
+  label: string;
+  custom: boolean;
+}
+
+export interface SalesforceField {
+  name: string;
+  label: string;
+  type: string;
+  nameField: boolean;
+}
+
+export interface DescribeFieldsResponse {
+  label: string;
+  supportsFiles: boolean;
+  fields: SalesforceField[];
+}
+
+export interface ContentDocument {
+  Title: string;
+  FileExtension: string;
+}
+
+export interface ContentDocumentLink {
+  ContentDocumentId: string;
+  ContentDocument: ContentDocument;
+}
+
+export interface Student {
+  Id: string;
+  Name: string;
+  Email__c: string;
+  College?: string;
+  Status?: string;
+  SentAt?: number | null;
+  ContentDocumentLinks?: {
+    records: ContentDocumentLink[];
+  };
 }
 
 export type DeliveryStatus =

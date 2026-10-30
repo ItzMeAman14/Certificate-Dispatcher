@@ -22,7 +22,6 @@ const METHODS: { id: ConnectMethod; title: string; subtitle: string; icon: Lucid
 const METHOD_LABEL: Record<ConnectMethod, string> = {
   client_credentials: 'Client ID & Secret',
   access_token: 'Access token',
-  password: 'Username & password',
 };
 
 const inputCls =

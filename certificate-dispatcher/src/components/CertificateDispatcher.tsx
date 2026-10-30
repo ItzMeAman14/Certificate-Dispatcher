@@ -6,10 +6,12 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock,
+  Database,
   File as FileIcon,
   FileCheck2,
   FileText,
   FileX2,
+  Filter,
   Inbox,
   Loader2,
   MailCheck,
@@ -32,12 +34,14 @@ import type {
   DeliveriesResponse,
   DeliveryCounts,
   DeliveryRecord,
-  DeliveryStatus,
   Me,
   PublicSettings,
+  QuotaInfo,
+  Student,
 } from '../api.ts';
 import ConnectSalesforce from './ConnectSalesforce.tsx';
 import SettingsModal from './SettingsModal.tsx';
+import DataSourceModal from './DataSourceModal.tsx';
 import EmailTemplateEditor, { getDefaultTemplate, normalizeTemplate } from './EmailTemplateEditor.tsx';
 import type { EmailTemplate } from './EmailTemplateEditor.tsx';
 import Footer from './Footer.tsx';
@@ -45,23 +49,6 @@ import Footer from './Footer.tsx';
 /* -------------------------------------------------------------------------- */
 /*                                    Types                                   */
 /* -------------------------------------------------------------------------- */
-
-interface ContentDocumentLinkRecord {
-  ContentDocumentId: string;
-  ContentDocument: {
-    Title: string;
-    FileExtension: string;
-  };
-}
-
-interface Student {
-  Id: string;
-  Name: string;
-  Email__c: string;
-  College?: string;
-  Status?: string;
-  ContentDocumentLinks?: { records: ContentDocumentLinkRecord[] } | null;
-}
 
 interface Certificate {
   documentId: string;
@@ -74,7 +61,8 @@ interface StudentRow {
   certificate: Certificate | null;
 }
 
-type FilterValue = 'all' | 'sent' | 'not_sent' | 'failed' | 'bounced' | 'ready' | 'missing';
+type EmailStatusFilter = 'all' | 'not_sent' | 'sent' | 'failed';
+type CertificateFilter = 'all' | 'has' | 'missing';
 
 /* -------------------------------------------------------------------------- */
 /*                                   Helpers                                  */
@@ -177,85 +165,104 @@ function CertificateBadge({ certificate }: { certificate: Certificate | null }) 
   );
 }
 
-function StatusBadge({ record }: { record?: DeliveryRecord | null }) {
-  if (!record || record.status === 'not_sent') {
+function StatusBadge({
+  record,
+  sentAt,
+}: {
+  record?: DeliveryRecord | null;
+  sentAt?: number | null;
+}) {
+  const isSent = Boolean(sentAt) || record?.status === 'sent' || record?.status === 'delivered';
+  const effectiveSentTime = sentAt || record?.sentAt || record?.deliveredAt;
+
+  if (record?.status === 'queued' || record?.status === 'sending') {
     return (
-      <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600">
-        <Clock className="h-3 w-3" />
-        Not Sent
+      <span className="inline-flex items-center gap-1.5 rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700">
+        <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+        {record.status === 'queued' ? 'Queued' : 'Sending...'}
       </span>
     );
   }
 
-  switch (record.status) {
-    case 'queued':
-    case 'sending':
-      return (
-        <span className="inline-flex items-center gap-1.5 rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700">
-          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-          {record.status === 'queued' ? 'Queued' : 'Sending...'}
-        </span>
-      );
-    case 'sent':
-      return (
-        <span
-          title={record.sentAt ? `Accepted by mail server at ${new Date(record.sentAt).toLocaleTimeString()}` : 'Sent'}
-          className="inline-flex items-center gap-1 rounded-full bg-blue-50 px-2.5 py-1 text-xs font-medium text-blue-700"
-        >
-          <MailCheck className="h-3.5 w-3.5 text-blue-600" />
-          Sent (Accepted)
-        </span>
-      );
-    case 'delivered':
-      return (
-        <span
-          title={record.deliveredAt ? `Delivered at ${new Date(record.deliveredAt).toLocaleTimeString()}` : 'Delivered'}
-          className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-700"
-        >
-          <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
-          Delivered
-        </span>
-      );
-    case 'bounced':
-      return (
-        <span
-          title={record.errorMessage || 'Bounced by recipient mail server'}
-          className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-800"
-        >
-          <AlertTriangle className="h-3.5 w-3.5 text-amber-600" />
-          Bounced
-        </span>
-      );
-    case 'failed':
-      return (
-        <span
-          title={record.errorMessage || 'Delivery failed'}
-          className="inline-flex items-center gap-1 rounded-full bg-red-50 px-2.5 py-1 text-xs font-medium text-red-700"
-        >
-          <XCircle className="h-3.5 w-3.5 text-red-600" />
-          Failed
-        </span>
-      );
-    default:
-      return (
-        <span className="inline-flex items-center rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600">
-          Not Sent
-        </span>
-      );
+  if (record?.status === 'delivered') {
+    return (
+      <span
+        title={effectiveSentTime ? `Delivered at ${new Date(effectiveSentTime).toLocaleString()}` : 'Delivered'}
+        className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-700 cursor-help"
+      >
+        <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
+        Delivered
+      </span>
+    );
   }
+
+  if (isSent) {
+    return (
+      <span
+        title={effectiveSentTime ? `Sent at ${new Date(effectiveSentTime).toLocaleString()}` : 'Sent'}
+        className="inline-flex items-center gap-1 rounded-full bg-blue-50 px-2.5 py-1 text-xs font-medium text-blue-700 cursor-help"
+      >
+        <MailCheck className="h-3.5 w-3.5 text-blue-600" />
+        Sent
+      </span>
+    );
+  }
+
+  if (record?.status === 'bounced') {
+    return (
+      <span
+        title={record.errorMessage || 'Bounced by recipient mail server'}
+        className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-800"
+      >
+        <AlertTriangle className="h-3.5 w-3.5 text-amber-600" />
+        Bounced
+      </span>
+    );
+  }
+
+  if (record?.status === 'failed') {
+    return (
+      <span
+        title={record.errorMessage || 'Delivery failed'}
+        className="inline-flex items-center gap-1 rounded-full bg-red-50 px-2.5 py-1 text-xs font-medium text-red-700"
+      >
+        <XCircle className="h-3.5 w-3.5 text-red-600" />
+        Failed
+      </span>
+    );
+  }
+
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600">
+      <Clock className="h-3 w-3" />
+      Not Sent
+    </span>
+  );
 }
 
 function SkeletonRows() {
   return (
     <>
-      {Array.from({ length: 6 }).map((_, i) => (
-        <tr key={i} className="border-t border-slate-100">
-          <td className="px-4 py-4"><div className="h-4 w-4 animate-pulse rounded bg-slate-200" /></td>
-          <td className="px-4 py-4"><div className="h-4 w-36 animate-pulse rounded bg-slate-200" /></td>
-          <td className="px-4 py-4"><div className="h-4 w-48 animate-pulse rounded bg-slate-200" /></td>
-          <td className="px-4 py-4"><div className="h-6 w-40 animate-pulse rounded bg-slate-200" /></td>
-          <td className="px-4 py-4"><div className="h-6 w-24 animate-pulse rounded-full bg-slate-200" /></td>
-          <td className="px-4 py-4 text-right"><div className="ml-auto h-8 w-28 animate-pulse rounded-lg bg-slate-200" /></td>
+      {Array.from({ length: 5 }).map((_, i) => (
+        <tr key={i} className="animate-pulse">
+          <td className="px-4 py-4">
+            <div className="h-4 w-4 rounded bg-slate-200" />
+          </td>
+          <td className="px-4 py-4">
+            <div className="h-4 w-32 rounded bg-slate-200" />
+          </td>
+          <td className="px-4 py-4">
+            <div className="h-4 w-44 rounded bg-slate-200" />
+          </td>
+          <td className="px-4 py-4">
+            <div className="h-4 w-28 rounded bg-slate-200" />
+          </td>
+          <td className="px-4 py-4">
+            <div className="h-6 w-24 rounded-full bg-slate-200" />
+          </td>
+          <td className="px-4 py-4 text-right">
+            <div className="ml-auto h-7 w-16 rounded bg-slate-200" />
+          </td>
         </tr>
       ))}
     </>
@@ -263,27 +270,30 @@ function SkeletonRows() {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                  Component                                 */
+/*                               Main Component                               */
 /* -------------------------------------------------------------------------- */
 
 interface Props {
   me: Me;
-  onMeChange: (me: Me) => void;
-  onSignOut: () => void;
+  onMeChange: (next: Me) => void;
   onUnauthorized: () => void;
+  onSignOut: () => void;
 }
 
-export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUnauthorized }: Props) {
+export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, onSignOut }: Props) {
   const [students, setStudents] = useState<Student[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loadErrorCode, setLoadErrorCode] = useState<string | null>(null);
   const [alertNotice, setAlertNotice] = useState<{ type: 'error' | 'success'; text: string } | null>(null);
 
+  // Quota state
+  const [quota, setQuota] = useState<QuotaInfo | null>(me.quota || null);
+
   // Deliveries map from NeonDB: studentId -> DeliveryRecord
   const [deliveriesMap, setDeliveriesMap] = useState<Record<string, DeliveryRecord>>({});
-  const [counts, setCounts] = useState<DeliveryCounts>({
+  const [, setCounts] = useState<DeliveryCounts>({
     total: 0,
     sent: 0,
     failed: 0,
@@ -292,12 +302,15 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
     notSent: 0,
   });
 
-  // Filter & Search Controls
+  // Filters state (Requirement 3)
   const [search, setSearch] = useState('');
-  const [filter, setFilter] = useState<FilterValue>('all');
+  const [emailStatusFilter, setEmailStatusFilter] = useState<EmailStatusFilter>('all');
+  const [certificateFilter, setCertificateFilter] = useState<CertificateFilter>('all');
+  const [collegeFilter, setCollegeFilter] = useState<string>('all');
+  const [statusFilter, setStatusFilter] = useState<string>('all');
+
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
-
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   // Campaign background queue state
@@ -311,6 +324,7 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
   const [editorOpen, setEditorOpen] = useState(false);
   const [connectionOpen, setConnectionOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [dataSourceOpen, setDataSourceOpen] = useState(false);
   const [confirmAllOpen, setConfirmAllOpen] = useState(false);
 
   /* ------------------------------ Data loading ----------------------------- */
@@ -341,10 +355,11 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
       setLoadErrorCode(null);
       try {
         const [sfRes] = await Promise.all([
-          api<{ success: true; data: Student[] }>('/api/students', { signal }),
+          api<{ success: true; data: Student[]; quota?: QuotaInfo }>('/api/students', { signal }),
           loadDeliveries(),
         ]);
         setStudents(sfRes.data);
+        if (sfRes.quota) setQuota(sfRes.quota);
 
         // Keep selections for students that exist and have certificates
         const selectable = new Set(sfRes.data.filter((st) => toRow(st).certificate).map((st) => st.Id));
@@ -355,8 +370,12 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
           onUnauthorized();
           return;
         }
+        const code = err instanceof ApiError ? (err.code ?? null) : null;
         setLoadError(errorMessage(err, 'Could not load students.'));
-        setLoadErrorCode(err instanceof ApiError ? (err.code ?? null) : null);
+        setLoadErrorCode(code);
+        if (code === 'NO_DATASOURCE') {
+          setDataSourceOpen(true);
+        }
       } finally {
         if (!signal?.aborted) setLoading(false);
       }
@@ -433,7 +452,6 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
       }
     };
 
-    // Fast initial check (800ms) for snappy feedback on single or small batch sends
     const initialTimer = setTimeout(() => {
       void poll();
     }, 800);
@@ -468,30 +486,90 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
 
   const rows = useMemo<StudentRow[]>(() => students.map(toRow), [students]);
 
+  // Distinct values for filters
+  const distinctColleges = useMemo(() => {
+    const set = new Set<string>();
+    students.forEach((s) => {
+      if (s.College && s.College.trim()) set.add(s.College.trim());
+    });
+    return Array.from(set).sort();
+  }, [students]);
+
+  const distinctStatuses = useMemo(() => {
+    const set = new Set<string>();
+    students.forEach((s) => {
+      if (s.Status && s.Status.trim()) set.add(s.Status.trim());
+    });
+    return Array.from(set).sort();
+  }, [students]);
+
+  const hasCollegeCol = Boolean(me.settings.collegeField) || distinctColleges.length > 0;
+  const hasStatusCol = Boolean(me.settings.statusField) || distinctStatuses.length > 0;
+
+  // Persisted emails sent count (Requirement 3)
+  const emailsSentCount = useMemo(() => {
+    return students.filter(
+      (s) =>
+        Boolean(s.SentAt) ||
+        deliveriesMap[s.Id]?.status === 'sent' ||
+        deliveriesMap[s.Id]?.status === 'delivered'
+    ).length;
+  }, [students, deliveriesMap]);
+
+  // Filtered rows
   const filteredRows = useMemo(() => {
     const q = search.trim().toLowerCase();
     return rows.filter(({ student, certificate }) => {
       const del = deliveriesMap[student.Id];
-      const status: DeliveryStatus = del ? del.status : 'not_sent';
+      const isSent = Boolean(student.SentAt) || del?.status === 'sent' || del?.status === 'delivered';
+      const isFailed = del?.status === 'failed' || del?.status === 'bounced';
+      const isNotSent = !isSent && !isFailed && del?.status !== 'queued' && del?.status !== 'sending';
 
-      // Status filters
-      if (filter === 'sent' && status !== 'sent') return false;
-      if (filter === 'not_sent' && status !== 'not_sent') return false;
-      if (filter === 'failed' && status !== 'failed') return false;
-      if (filter === 'bounced' && status !== 'bounced') return false;
-      if (filter === 'ready' && (!certificate || status === 'sent')) return false;
-      if (filter === 'missing' && certificate) return false;
+      // 1. Email Status filter
+      if (emailStatusFilter === 'not_sent' && !isNotSent) return false;
+      if (emailStatusFilter === 'sent' && !isSent) return false;
+      if (emailStatusFilter === 'failed' && !isFailed) return false;
 
-      // Text search
+      // 2. Certificate filter
+      if (certificateFilter === 'has' && !certificate) return false;
+      if (certificateFilter === 'missing' && certificate) return false;
+
+      // 3. College filter
+      if (collegeFilter !== 'all' && (student.College || '').trim() !== collegeFilter) return false;
+
+      // 4. Status filter
+      if (statusFilter !== 'all' && (student.Status || '').trim() !== statusFilter) return false;
+
+      // 5. Search text (matches Name, Email, College, Id)
       if (!q) return true;
       return (
-        student.Name?.toLowerCase().includes(q) ||
-        student.Email__c?.toLowerCase().includes(q) ||
-        student.College?.toLowerCase().includes(q) ||
-        student.Id?.toLowerCase().includes(q)
+        (student.Name || '').toLowerCase().includes(q) ||
+        (student.Email__c || '').toLowerCase().includes(q) ||
+        (student.College || '').toLowerCase().includes(q) ||
+        (student.Status || '').toLowerCase().includes(q) ||
+        student.Id.toLowerCase().includes(q)
       );
     });
-  }, [rows, deliveriesMap, filter, search]);
+  }, [rows, deliveriesMap, emailStatusFilter, certificateFilter, collegeFilter, statusFilter, search]);
+
+  const activeFilterCount = useMemo(() => {
+    let count = 0;
+    if (emailStatusFilter !== 'all') count++;
+    if (certificateFilter !== 'all') count++;
+    if (collegeFilter !== 'all') count++;
+    if (statusFilter !== 'all') count++;
+    if (search.trim() !== '') count++;
+    return count;
+  }, [emailStatusFilter, certificateFilter, collegeFilter, statusFilter, search]);
+
+  const clearFilters = () => {
+    setEmailStatusFilter('all');
+    setCertificateFilter('all');
+    setCollegeFilter('all');
+    setStatusFilter('all');
+    setSearch('');
+    setPage(1);
+  };
 
   // Pagination
   const totalItems = filteredRows.length;
@@ -512,10 +590,9 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
     () =>
       rows.filter((r) => {
         const d = deliveriesMap[r.student.Id];
-        return (
-          r.certificate &&
-          (!d || (d.status !== 'sent' && d.status !== 'delivered' && d.status !== 'sending' && d.status !== 'queued'))
-        );
+        const isSent = Boolean(r.student.SentAt) || d?.status === 'sent' || d?.status === 'delivered';
+        const isSending = d?.status === 'sending' || d?.status === 'queued';
+        return r.certificate && !isSent && !isSending;
       }),
     [rows, deliveriesMap]
   );
@@ -552,26 +629,32 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
         certificateName: t.certificate?.fileName,
       }));
 
-      const res = await api<{ success: true; campaignId: string; queuedCount: number; message: string }>(
-        '/api/campaigns/queue',
-        {
-          method: 'POST',
-          body: {
-            name: `Dispatch ${new Date().toLocaleDateString()} (${items.length} students)`,
-            subject: template.subject,
-            htmlTemplate: template.html,
-            items,
-          },
-        }
-      );
+      const res = await api<{
+        success: true;
+        campaignId: string;
+        queuedCount: number;
+        leftForLater?: number;
+        quota?: QuotaInfo;
+        message: string;
+      }>('/api/campaigns/queue', {
+        method: 'POST',
+        body: {
+          name: `Dispatch ${new Date().toLocaleDateString()} (${items.length} students)`,
+          subject: template.subject,
+          htmlTemplate: template.html,
+          items,
+        },
+      });
+
+      if (res.quota) setQuota(res.quota);
 
       // Start progress tracking
       setActiveCampaign({
         id: res.campaignId,
-        name: `Dispatch (${items.length} students)`,
+        name: `Dispatch (${res.queuedCount} students)`,
         subject: template.subject,
-        totalRecipients: items.length,
-        queuedCount: items.length,
+        totalRecipients: res.queuedCount,
+        queuedCount: res.queuedCount,
         sentCount: 0,
         failedCount: 0,
         bouncedCount: 0,
@@ -580,9 +663,13 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
         updatedAt: Date.now(),
       });
 
+      const msg = res.leftForLater && res.leftForLater > 0
+        ? `Queued ${res.queuedCount} certificate(s). ${res.leftForLater} left for later due to daily limit.`
+        : `Queued ${res.queuedCount} certificate(s) for background dispatch.`;
+
       setAlertNotice({
         type: 'success',
-        text: `Queued ${items.length} certificate(s) for background sending. Background worker is actively dispatching.`,
+        text: msg,
       });
 
       // Clear selections for queued students
@@ -657,12 +744,16 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
     });
 
   const canSend = me.emailConfigured && templateReady;
+  const noQuotaRemaining = Boolean(quota && quota.limit > 0 && quota.used >= quota.limit);
 
   const saveTemplate = async (next: EmailTemplate) => {
     setTemplate(next);
     setEditorOpen(false);
     try {
-      await api('/api/template', { method: 'PUT', body: { subject: next.subject, blocks: next.blocks, html: next.html } });
+      await api('/api/template', {
+        method: 'PUT',
+        body: { subject: next.subject, blocks: next.blocks, html: next.html },
+      });
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) onUnauthorized();
       else setAlertNotice({ type: 'error', text: `Failed to save template: ${errorMessage(err, 'unknown error')}` });
@@ -673,7 +764,11 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
     const wasConnected = Boolean(me.connection);
     onMeChange({ ...me, connection });
     setConnectionOpen(false);
-    if (wasConnected) void loadStudents();
+    if (!me.settings.dataSourceSet) {
+      setDataSourceOpen(true);
+    } else if (wasConnected) {
+      void loadStudents();
+    }
   };
 
   const handleDisconnected = () => {
@@ -684,11 +779,14 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
   };
 
   const handleSettingsSaved = (settings: PublicSettings, emailConfigured: boolean) => {
-    const dataSourceChanged =
-      settings.studentObject !== me.settings.studentObject || settings.emailField !== me.settings.emailField;
     onMeChange({ ...me, settings, emailConfigured });
     setSettingsOpen(false);
-    if (dataSourceChanged && me.connection) void loadStudents();
+  };
+
+  const handleDataSourceSaved = (settings: PublicSettings) => {
+    onMeChange({ ...me, settings });
+    setDataSourceOpen(false);
+    void loadStudents();
   };
 
   /* ---------------------------------- JSX ---------------------------------- */
@@ -696,21 +794,60 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
   const topBar = (
     <div className="border-b border-slate-200 bg-white shadow-xs">
       <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-2.5 sm:px-6 lg:px-8">
-        <button
-          type="button"
-          onClick={() => setConnectionOpen(true)}
-          className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-100 cursor-pointer"
-        >
-          <span className={`h-2 w-2 rounded-full ${me.connection ? 'bg-emerald-500' : 'bg-amber-500'}`} aria-hidden />
-          {me.connection ? `Connected: ${me.connection.orgName}` : 'Connect Salesforce'}
-          <Plug className="h-3.5 w-3.5 text-slate-400" aria-hidden />
-        </button>
+        <div className="flex items-center gap-2">
+          {/* Salesforce connection pill */}
+          <button
+            type="button"
+            onClick={() => setConnectionOpen(true)}
+            className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-100 cursor-pointer"
+          >
+            <span
+              className={`h-2 w-2 rounded-full ${me.connection ? 'bg-emerald-500' : 'bg-amber-500'}`}
+              aria-hidden
+            />
+            {me.connection ? `Connected: ${me.connection.orgName}` : 'Connect Salesforce'}
+            <Plug className="h-3.5 w-3.5 text-slate-400" aria-hidden />
+          </button>
+
+          {/* Data source chip (Requirement 2) */}
+          {me.connection && (
+            <button
+              type="button"
+              onClick={() => setDataSourceOpen(true)}
+              className="inline-flex items-center gap-1.5 rounded-full border border-indigo-200 bg-indigo-50/70 px-3 py-1.5 text-xs font-medium text-indigo-700 transition hover:bg-indigo-100 cursor-pointer"
+              title="Configure Salesforce data source"
+            >
+              <Database className="h-3.5 w-3.5 text-indigo-500" />
+              Data: {me.settings.studentObject || 'Choose object'}
+            </button>
+          )}
+
+          {/* Daily limit badge (Requirement 4) */}
+          {quota && quota.limit > 0 && (
+            <div
+              className="hidden sm:inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-2xs"
+              title={`Resets at ${quota.resetsAt ? new Date(quota.resetsAt).toLocaleTimeString() : 'rolling 24h'}`}
+            >
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  quota.used >= quota.limit ? 'bg-red-500' : 'bg-emerald-500'
+                }`}
+              />
+              <span>
+                Daily limit: <strong className="text-slate-900">{quota.used}</strong> / {quota.limit}
+              </span>
+            </div>
+          )}
+        </div>
+
         <div className="flex items-center gap-1 sm:gap-2">
-          <span className="hidden max-w-[14rem] truncate text-xs text-slate-500 sm:inline">{me.user.email}</span>
+          <span className="hidden max-w-[14rem] truncate text-xs text-slate-500 sm:inline">
+            {me.user.email}
+          </span>
           <button
             type="button"
             onClick={() => setSettingsOpen(true)}
-            className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100"
+            className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100 cursor-pointer"
           >
             <SettingsIcon className="h-4 w-4" aria-hidden />
             Settings
@@ -718,7 +855,7 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
           <button
             type="button"
             onClick={onSignOut}
-            className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100"
+            className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100 cursor-pointer"
           >
             <LogOut className="h-4 w-4" aria-hidden />
             Sign out
@@ -738,7 +875,7 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
           <div>
             <h1 className="text-2xl font-bold tracking-tight text-slate-900">Certificate Dispatcher</h1>
             <p className="mt-1 text-sm text-slate-500">
-              Reliably dispatch certificates to up to 500 students with persistent NeonDB delivery tracking.
+              Reliably dispatch certificates with persistent delivery tracking and daily quota safety.
             </p>
           </div>
 
@@ -747,8 +884,8 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
               type="button"
               onClick={handleManualRefresh}
               disabled={refreshing || loading}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-50"
-              title="Refresh delivery status from NeonDB"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+              title="Refresh delivery status"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin text-indigo-600' : ''}`} />
               Refresh
@@ -757,7 +894,7 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
             <button
               type="button"
               onClick={() => setEditorOpen(true)}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 shadow-sm hover:bg-slate-50"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 shadow-sm hover:bg-slate-50 cursor-pointer"
             >
               <PenLine className="h-3.5 w-3.5 text-indigo-600" />
               Edit Template
@@ -768,7 +905,7 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
                 type="button"
                 onClick={handleRetryFailed}
                 disabled={isRetrying || isQueueing || !canSend}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-semibold text-red-700 shadow-sm hover:bg-red-100 disabled:opacity-50"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-semibold text-red-700 shadow-sm hover:bg-red-100 disabled:opacity-50 cursor-pointer"
               >
                 <RotateCcw className={`h-3.5 w-3.5 ${isRetrying ? 'animate-spin' : ''}`} />
                 Retry {failedItems.length} Failed
@@ -779,7 +916,7 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
               type="button"
               onClick={sendSelected}
               disabled={selectedIds.size === 0 || isQueueing || !canSend}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-semibold text-white shadow-sm hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-semibold text-white shadow-sm hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-slate-300 cursor-pointer"
             >
               <Send className="h-3.5 w-3.5" />
               Send Selected ({selectedIds.size})
@@ -788,9 +925,11 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
             <button
               type="button"
               onClick={() => setConfirmAllOpen(true)}
-              disabled={readyToSendAll.length === 0 || isQueueing || !canSend}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow-sm hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+              disabled={readyToSendAll.length === 0 || isQueueing || !canSend || noQuotaRemaining}
+              title={noQuotaRemaining ? 'Daily send limit reached' : undefined}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow-sm hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-slate-300 cursor-pointer"
             >
+              <Send className="h-3.5 w-3.5" />
               Send All Ready ({readyToSendAll.length})
             </button>
           </div>
@@ -893,7 +1032,7 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
               <button
                 type="button"
                 onClick={() => setAlertNotice(null)}
-                className="rounded-md p-1 text-slate-500 hover:bg-slate-200/50"
+                className="rounded-md p-1 text-slate-500 hover:bg-slate-200/50 cursor-pointer"
               >
                 <X className="h-4 w-4" />
               </button>
@@ -901,28 +1040,62 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
           )}
 
           {loadError && (
-            <div role="alert" className="flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            <div
+              role="alert"
+              className={`flex items-start gap-3 rounded-xl border p-4 text-sm ${
+                loadErrorCode === 'NO_DATASOURCE'
+                  ? 'border-indigo-200 bg-indigo-50 text-indigo-900'
+                  : 'border-red-200 bg-red-50 text-red-800'
+              }`}
+            >
+              {loadErrorCode === 'NO_DATASOURCE' ? (
+                <Database className="mt-0.5 h-4 w-4 shrink-0 text-indigo-600" />
+              ) : (
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-600" />
+              )}
               <div className="flex-1">
-                <p className="font-medium">Couldn’t load students</p>
-                <p className="mt-0.5 text-red-700">{loadError}</p>
+                <p className="font-semibold">
+                  {loadErrorCode === 'NO_DATASOURCE'
+                    ? 'Choose where your students are stored'
+                    : 'Couldn’t load students'}
+                </p>
+                <p className="mt-0.5 text-xs">
+                  {loadErrorCode === 'NO_DATASOURCE'
+                    ? 'Connect your student object (e.g. Student__c or Contact) and map the Name and Email fields to begin dispatching certificates.'
+                    : loadError}
+                </p>
               </div>
               <button
                 type="button"
-                onClick={() =>
-                  loadErrorCode === 'NO_CONNECTION' || loadErrorCode === 'SF_SESSION_EXPIRED'
-                    ? setConnectionOpen(true)
-                    : void loadStudents()
-                }
-                className="rounded-md px-2 py-1 text-xs font-semibold text-red-800 underline hover:no-underline"
+                onClick={() => {
+                  if (loadErrorCode === 'NO_DATASOURCE') {
+                    setDataSourceOpen(true);
+                  } else if (
+                    loadErrorCode === 'NO_CONNECTION' ||
+                    loadErrorCode === 'SF_SESSION_EXPIRED'
+                  ) {
+                    setConnectionOpen(true);
+                  } else {
+                    void loadStudents();
+                  }
+                }}
+                className={`rounded-md px-2.5 py-1 text-xs font-semibold ${
+                  loadErrorCode === 'NO_DATASOURCE'
+                    ? 'bg-indigo-600 text-white shadow-xs hover:bg-indigo-700'
+                    : 'text-red-800 underline hover:no-underline'
+                }`}
               >
-                {loadErrorCode === 'NO_CONNECTION' || loadErrorCode === 'SF_SESSION_EXPIRED' ? 'Reconnect' : 'Try again'}
+                {loadErrorCode === 'NO_DATASOURCE'
+                  ? 'Configure Data Source'
+                  : loadErrorCode === 'NO_CONNECTION' || loadErrorCode === 'SF_SESSION_EXPIRED'
+                  ? 'Reconnect'
+                  : 'Try again'}
               </button>
             </div>
           )}
         </div>
 
-        {/* KPI Cards */}
+        {/* KPI Cards (Requirement 3: "Emails Sent" persisted) */}
         <section className="mt-6 grid grid-cols-2 gap-4 sm:grid-cols-4" aria-label="Key metrics">
           <MetricCard
             label="Total Students"
@@ -939,89 +1112,142 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
             icon={<FileCheck2 className="h-5 w-5" />}
           />
           <MetricCard
-            label="Sent"
-            value={counts.sent}
-            loading={false}
+            label="Emails Sent"
+            value={emailsSentCount}
+            loading={loading && students.length === 0}
             tone="bg-blue-50 text-blue-600"
             icon={<MailCheck className="h-5 w-5" />}
           />
+          <MetricCard
+            label="Failed / Bounced"
+            value={failedItems.length}
+            loading={loading && students.length === 0}
+            tone="bg-amber-50 text-amber-600"
+            icon={<AlertTriangle className="h-5 w-5" />}
+          />
         </section>
 
-        {/* Filter Tabs & Search Controls */}
+        {/* Filters and Table Section (Requirement 3) */}
         <section className="mt-6 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-          {/* Status Filter Tabs */}
-          <div className="border-b border-slate-200 bg-slate-50/60 px-4 pt-3">
-            <div className="flex flex-wrap gap-2 text-xs font-medium">
-              {[
-                { id: 'all', label: 'All', count: students.length },
-                { id: 'sent', label: 'Sent', count: counts.sent },
-                { id: 'not_sent', label: 'Not Sent', count: counts.notSent },
-                { id: 'failed', label: 'Failed', count: counts.failed },
-                { id: 'bounced', label: 'Bounced', count: counts.bounced },
-                { id: 'ready', label: 'Ready to Send', count: readyToSendAll.length },
-                { id: 'missing', label: 'Missing Certificate', count: rows.filter((r) => !r.certificate).length },
-              ].map((tab) => {
-                const active = filter === tab.id;
-                return (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    onClick={() => {
-                      setFilter(tab.id as FilterValue);
+          {/* Controls Bar: Filters and Search */}
+          <div className="border-b border-slate-200 bg-slate-50/70 p-4 space-y-3">
+            <div className="flex flex-wrap items-center gap-3">
+              {/* Search Box */}
+              <div className="relative min-w-[220px] flex-1">
+                <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="search"
+                  value={search}
+                  onChange={(e) => {
+                    setSearch(e.target.value);
+                    setPage(1);
+                  }}
+                  placeholder="Search by student name, email, college, or ID…"
+                  className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                />
+              </div>
+
+              {/* Email Status Filter Dropdown */}
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-medium text-slate-500">Email:</span>
+                <select
+                  value={emailStatusFilter}
+                  onChange={(e) => {
+                    setEmailStatusFilter(e.target.value as EmailStatusFilter);
+                    setPage(1);
+                  }}
+                  className="rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs font-medium text-slate-700 focus:border-indigo-500 focus:outline-none"
+                >
+                  <option value="all">All Status</option>
+                  <option value="not_sent">Not sent yet</option>
+                  <option value="sent">Already sent</option>
+                  <option value="failed">Failed</option>
+                </select>
+              </div>
+
+              {/* Certificate Filter Dropdown */}
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-medium text-slate-500">Certificate:</span>
+                <select
+                  value={certificateFilter}
+                  onChange={(e) => {
+                    setCertificateFilter(e.target.value as CertificateFilter);
+                    setPage(1);
+                  }}
+                  className="rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs font-medium text-slate-700 focus:border-indigo-500 focus:outline-none"
+                >
+                  <option value="all">All certificates</option>
+                  <option value="has">Has certificate</option>
+                  <option value="missing">Missing certificate</option>
+                </select>
+              </div>
+
+              {/* College Filter Dropdown */}
+              {distinctColleges.length > 0 && (
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-medium text-slate-500">College:</span>
+                  <select
+                    value={collegeFilter}
+                    onChange={(e) => {
+                      setCollegeFilter(e.target.value);
                       setPage(1);
                     }}
-                    className={`inline-flex items-center gap-1.5 border-b-2 px-3 py-2 transition-colors ${
-                      active
-                        ? 'border-indigo-600 font-semibold text-indigo-700'
-                        : 'border-transparent text-slate-600 hover:border-slate-300 hover:text-slate-900'
-                    }`}
+                    className="rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs font-medium text-slate-700 focus:border-indigo-500 focus:outline-none max-w-[150px] truncate"
                   >
-                    {tab.label}
-                    <span
-                      className={`rounded-full px-1.5 py-0.5 text-[11px] tabular-nums ${
-                        active ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-200 text-slate-600'
-                      }`}
-                    >
-                      {tab.count}
-                    </span>
-                  </button>
-                );
-              })}
+                    <option value="all">All Colleges</option>
+                    {distinctColleges.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {/* Status Filter Dropdown */}
+              {distinctStatuses.length > 0 && (
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-medium text-slate-500">Status:</span>
+                  <select
+                    value={statusFilter}
+                    onChange={(e) => {
+                      setStatusFilter(e.target.value);
+                      setPage(1);
+                    }}
+                    className="rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs font-medium text-slate-700 focus:border-indigo-500 focus:outline-none max-w-[140px] truncate"
+                  >
+                    <option value="all">All Statuses</option>
+                    {distinctStatuses.map((st) => (
+                      <option key={st} value={st}>
+                        {st}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
             </div>
           </div>
 
-          {/* Search & Page Size Bar */}
-          <div className="flex flex-col gap-3 border-b border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between">
-            <div className="relative w-full sm:max-w-md">
-              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-              <input
-                type="search"
-                value={search}
-                onChange={(e) => {
-                  setSearch(e.target.value);
-                  setPage(1);
-                }}
-                placeholder="Search by student name, email, or ID..."
-                className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
-              />
-            </div>
+          {/* Filter Match Count Summary Line */}
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50/40 px-4 py-2 text-xs text-slate-600">
+            <span className="flex items-center gap-1.5 font-medium">
+              <Filter className="h-3.5 w-3.5 text-slate-400" />
+              <span>
+                <strong className="text-slate-900">{filteredRows.length}</strong> of{' '}
+                <strong className="text-slate-900">{rows.length}</strong> match{' '}
+                {activeFilterCount} filter{activeFilterCount === 1 ? '' : 's'}
+              </span>
+            </span>
 
-            <div className="flex items-center justify-end gap-3 text-xs text-slate-600">
-              <span>Show per page:</span>
-              <select
-                value={pageSize}
-                onChange={(e) => {
-                  setPageSize(Number(e.target.value));
-                  setPage(1);
-                }}
-                className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 focus:border-indigo-500 focus:outline-none"
+            {activeFilterCount > 0 && (
+              <button
+                type="button"
+                onClick={clearFilters}
+                className="font-semibold text-indigo-600 underline hover:text-indigo-800 cursor-pointer"
               >
-                <option value={10}>10</option>
-                <option value={25}>25</option>
-                <option value={50}>50</option>
-                <option value={100}>100</option>
-              </select>
-            </div>
+                Clear filters
+              </button>
+            )}
           </div>
 
           {/* Students Table */}
@@ -1040,8 +1266,10 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
                   </th>
                   <th scope="col" className="px-4 py-3">Student Name</th>
                   <th scope="col" className="px-4 py-3">Email Address</th>
+                  {hasCollegeCol && <th scope="col" className="px-4 py-3">College</th>}
+                  {hasStatusCol && <th scope="col" className="px-4 py-3">Status</th>}
                   <th scope="col" className="px-4 py-3">Certificate</th>
-                  <th scope="col" className="px-4 py-3">Delivery Status (NeonDB)</th>
+                  <th scope="col" className="px-4 py-3">Email Status</th>
                   <th scope="col" className="px-4 py-3 text-right">Action</th>
                 </tr>
               </thead>
@@ -1050,7 +1278,7 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
                   <SkeletonRows />
                 ) : pagedRows.length === 0 ? (
                   <tr>
-                    <td colSpan={6} className="px-4 py-16 text-center">
+                    <td colSpan={hasCollegeCol && hasStatusCol ? 8 : hasCollegeCol || hasStatusCol ? 7 : 6} className="px-4 py-16 text-center">
                       <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-slate-100 text-slate-400">
                         <Inbox className="h-6 w-6" />
                       </div>
@@ -1058,15 +1286,11 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
                       <p className="mt-1 text-sm text-slate-500">
                         Try resetting your search or filter criteria.
                       </p>
-                      {(search || filter !== 'all') && (
+                      {activeFilterCount > 0 && (
                         <button
                           type="button"
-                          onClick={() => {
-                            setSearch('');
-                            setFilter('all');
-                            setPage(1);
-                          }}
-                          className="mt-4 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50"
+                          onClick={clearFilters}
+                          className="mt-4 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 cursor-pointer"
                         >
                           Clear filters
                         </button>
@@ -1096,14 +1320,32 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
                         </td>
                         <td className="whitespace-nowrap px-4 py-3.5 font-medium text-slate-900">
                           <div>{student.Name}</div>
-                          {student.College && <div className="text-xs font-normal text-slate-500">{student.College}</div>}
                         </td>
-                        <td className="px-4 py-3.5 text-slate-600">{student.Email__c}</td>
+                        <td className="px-4 py-3.5 text-slate-600 font-mono text-xs">{student.Email__c}</td>
+
+                        {hasCollegeCol && (
+                          <td className="px-4 py-3.5 text-slate-600 text-xs">
+                            {student.College || <span className="text-slate-400">—</span>}
+                          </td>
+                        )}
+
+                        {hasStatusCol && (
+                          <td className="px-4 py-3.5 text-xs">
+                            {student.Status ? (
+                              <span className="inline-block rounded bg-slate-100 px-2 py-0.5 font-medium text-slate-700">
+                                {student.Status}
+                              </span>
+                            ) : (
+                              <span className="text-slate-400">—</span>
+                            )}
+                          </td>
+                        )}
+
                         <td className="px-4 py-3.5">
                           <CertificateBadge certificate={certificate} />
                         </td>
                         <td className="px-4 py-3.5">
-                          <StatusBadge record={record} />
+                          <StatusBadge record={record} sentAt={student.SentAt} />
                           {record?.errorMessage && (
                             <p className="mt-1 max-w-[14rem] truncate text-xs text-red-600" title={record.errorMessage}>
                               {record.errorMessage}
@@ -1115,8 +1357,8 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
                             type="button"
                             onClick={() => certificate && void queueCampaign([{ student, certificate }])}
                             disabled={!certificate || isQueuedOrSending || !canSend}
-                            className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium shadow-xs transition ${
-                              record?.status === 'sent'
+                            className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium shadow-xs transition cursor-pointer ${
+                              Boolean(student.SentAt) || record?.status === 'sent' || record?.status === 'delivered'
                                 ? 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
                                 : record?.status === 'failed' || record?.status === 'bounced'
                                 ? 'border border-red-200 bg-red-50 text-red-700 hover:bg-red-100'
@@ -1124,7 +1366,7 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
                             }`}
                           >
                             <Send className="h-3 w-3" />
-                            {record?.status === 'sent'
+                            {Boolean(student.SentAt) || record?.status === 'sent' || record?.status === 'delivered'
                               ? 'Resend'
                               : record?.status === 'failed' || record?.status === 'bounced'
                               ? 'Retry'
@@ -1141,16 +1383,35 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
 
           {/* Table Pagination Bar */}
           <div className="flex flex-col items-center justify-between gap-3 border-t border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500 sm:flex-row">
-            <div>
-              Showing {totalItems === 0 ? 0 : (currentPage - 1) * pageSize + 1} to{' '}
-              {Math.min(currentPage * pageSize, totalItems)} of {totalItems} students
+            <div className="flex items-center gap-4">
+              <span>
+                Showing {totalItems === 0 ? 0 : (currentPage - 1) * pageSize + 1} to{' '}
+                {Math.min(currentPage * pageSize, totalItems)} of {totalItems} students
+              </span>
+              <div className="flex items-center gap-1.5">
+                <span>Show:</span>
+                <select
+                  value={pageSize}
+                  onChange={(e) => {
+                    setPageSize(Number(e.target.value));
+                    setPage(1);
+                  }}
+                  className="rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700"
+                >
+                  <option value={10}>10</option>
+                  <option value={25}>25</option>
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                </select>
+              </div>
             </div>
+
             <div className="flex items-center gap-2">
               <button
                 type="button"
                 onClick={() => setPage((p) => Math.max(1, p - 1))}
                 disabled={currentPage <= 1}
-                className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 font-medium text-slate-700 shadow-xs hover:bg-slate-50 disabled:opacity-40"
+                className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 font-medium text-slate-700 shadow-xs hover:bg-slate-50 disabled:opacity-40 cursor-pointer"
               >
                 <ChevronLeft className="h-4 w-4" />
                 Previous
@@ -1162,7 +1423,7 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
                 type="button"
                 onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
                 disabled={currentPage >= totalPages}
-                className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 font-medium text-slate-700 shadow-xs hover:bg-slate-50 disabled:opacity-40"
+                className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 font-medium text-slate-700 shadow-xs hover:bg-slate-50 disabled:opacity-40 cursor-pointer"
               >
                 Next
                 <ChevronRight className="h-4 w-4" />
@@ -1172,7 +1433,7 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
         </section>
       </div>
 
-      {/* Confirmation Modal */}
+      {/* Confirmation Modal (Requirement 4: Quota safety & left-for-later reporting) */}
       {confirmAllOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-xs">
           <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl">
@@ -1181,21 +1442,46 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
               Are you sure you want to queue background sending for{' '}
               <strong className="text-slate-900">{readyToSendAll.length} students</strong>?
             </p>
-            <p className="mt-2 text-xs text-slate-500">
+
+            {quota && quota.limit > 0 && (
+              <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700 space-y-1.5">
+                <div className="flex justify-between font-semibold">
+                  <span>Daily send limit:</span>
+                  <span>
+                    {quota.used} / {quota.limit} used ({Math.max(0, quota.limit - quota.used)} remaining)
+                  </span>
+                </div>
+                {readyToSendAll.length > Math.max(0, quota.limit - quota.used) && (
+                  <p className="text-amber-700 font-medium">
+                    Only {Math.max(0, quota.limit - quota.used)} will be dispatched now;{' '}
+                    {readyToSendAll.length - Math.max(0, quota.limit - quota.used)} will be left for later.
+                  </p>
+                )}
+                {quota.used >= quota.limit && (
+                  <p className="text-red-600 font-semibold">
+                    Daily limit reached. Resets at{' '}
+                    {quota.resetsAt ? new Date(quota.resetsAt).toLocaleTimeString() : 'in 24 hours'}.
+                  </p>
+                )}
+              </div>
+            )}
+
+            <p className="mt-3 text-xs text-slate-500">
               The jobs will be processed safely in the background with rate limiting. You can monitor live progress on this screen.
             </p>
             <div className="mt-6 flex justify-end gap-3">
               <button
                 type="button"
                 onClick={() => setConfirmAllOpen(false)}
-                className="rounded-lg border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                className="rounded-lg border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
               >
                 Cancel
               </button>
               <button
                 type="button"
                 onClick={sendAll}
-                className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-700"
+                disabled={quota && quota.limit > 0 && quota.used >= quota.limit}
+                className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
               >
                 Start Dispatching
               </button>
@@ -1229,6 +1515,17 @@ export default function CertificateDispatcher({ me, onMeChange, onSignOut, onUna
           onDisconnected={handleDisconnected}
           onUnauthorized={onUnauthorized}
           onClose={() => setConnectionOpen(false)}
+        />
+      )}
+
+      {/* Data Source Picker Modal (Requirement 2) */}
+      {dataSourceOpen && (
+        <DataSourceModal
+          currentSettings={me.settings}
+          onSaved={handleDataSourceSaved}
+          onClose={() => setDataSourceOpen(false)}
+          onUnauthorized={onUnauthorized}
+          isInitialSetup={!me.settings.dataSourceSet}
         />
       )}
 

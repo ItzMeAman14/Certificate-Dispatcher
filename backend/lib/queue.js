@@ -148,12 +148,13 @@ async function processJob(job) {
 
     // 3. Salesforce: verify & download certificate
     const { student, file } = await sf.withSalesforce(user, async (conn) => {
-      const emailField = s.emailField || 'Email';
-      const studentObject = s.studentObject || 'Contact';
+      const emailField = s.emailField || 'Email__c';
+      const nameField = s.nameField || 'Name';
+      const studentObject = s.studentObject || 'Student__c';
 
       const [studentRec] = await sf.queryAll(
         conn,
-        `SELECT Id, Name, ${emailField} FROM ${studentObject} WHERE Id = '${studentId}' LIMIT 1`
+        `SELECT Id, ${nameField}, ${emailField} FROM ${studentObject} WHERE Id = '${studentId}' LIMIT 1`
       );
       if (!studentRec) throw new Error(`Student ${studentId} not found in Salesforce`);
 
@@ -179,7 +180,7 @@ async function processJob(job) {
       const content = await sf.downloadVersionData(conn, version.Id);
       const fileName = version.FileExtension ? `${version.Title}.${version.FileExtension}` : version.Title;
       return {
-        student: { name: studentRec.Name || 'Student', email },
+        student: { name: studentRec[nameField] || 'Student', email },
         file: { fileName, content },
       };
     });
@@ -211,8 +212,9 @@ async function processJob(job) {
     const subjectLine = fillTemplate(job.subject || 'Your certificate', plainVars).replace(/[\r\n]+/g, ' ');
 
     // 6. Send Mail
+    const fromAddress = s.fromEmail || s.smtpUser;
     const info = await transport.sendMail({
-      from: `"${(s.fromName || s.smtpUser).replace(/"/g, '')}" <${s.smtpUser}>`,
+      from: `"${(s.fromName || fromAddress).replace(/"/g, '')}" <${fromAddress}>`,
       replyTo: s.replyTo || undefined,
       to: student.email,
       cc: s.cc || undefined,
@@ -230,6 +232,11 @@ async function processJob(job) {
 
     // 7. Success state update (Marked as 'sent' / Accepted by provider)
     await store.completeJob(jobId, deliveryId, providerMessageId);
+    await store.recordSent(userId, studentId, {
+      at: Date.now(),
+      to: student.email,
+      file: file.fileName,
+    });
     await store.recordEmailEvent({
       deliveryId,
       userId,
@@ -263,6 +270,7 @@ async function processJob(job) {
       await store.refreshCampaignStats(campaignId, userId);
     }
   } finally {
+    store.releaseSend(userId, 1);
     activeJobsCount--;
   }
 }

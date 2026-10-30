@@ -56,9 +56,11 @@ async function buildConnection(creds) {
     const host = normalizeHost(token.instance_url, 'Instance URL');
     return new jsforce.Connection({ instanceUrl: `https://${host}`, accessToken: token.access_token });
   }
-  // access_token and password both end up as a ready-made session
-  const host = normalizeHost(creds.instanceUrl, 'Instance URL');
-  return new jsforce.Connection({ instanceUrl: `https://${host}`, accessToken: creds.accessToken });
+  if (creds.method === 'access_token') {
+    const host = normalizeHost(creds.instanceUrl, 'Instance URL');
+    return new jsforce.Connection({ instanceUrl: `https://${host}`, accessToken: creds.accessToken });
+  }
+  throw new HttpError(400, 'Invalid or unsupported connection method');
 }
 
 async function verify(conn) {
@@ -72,7 +74,7 @@ async function verify(conn) {
 
 /**
  * Validates what the user typed in the UI, proves it works against Salesforce, and returns
- * the credentials to store (encrypted). Passwords are never stored: only the resulting session.
+ * the credentials to store (encrypted).
  */
 async function connectAndVerify(input) {
   const method = input && input.method;
@@ -95,17 +97,8 @@ async function connectAndVerify(input) {
         accessToken: required(input.accessToken, 'Access token'),
       };
       conn = await buildConnection(creds);
-    } else if (method === 'password') {
-      const loginHost = normalizeHost(input.loginHost || 'login.salesforce.com', 'Login URL');
-      const username = required(input.username, 'Username', 200);
-      const password = required(input.password, 'Password', 200);
-      const token = String(input.securityToken || '').trim();
-      conn = new jsforce.Connection({ loginUrl: `https://${loginHost}` });
-      await conn.login(username, password + token);
-      const host = normalizeHost(conn.instanceUrl, 'Instance URL');
-      creds = { method, instanceUrl: `https://${host}`, accessToken: conn.accessToken, username };
     } else {
-      throw new HttpError(400, 'Choose a connection method');
+      throw new HttpError(400, 'Choose a valid connection method (Client ID & Secret or Access token)');
     }
   } catch (err) {
     if (err instanceof HttpError) throw err;
@@ -185,17 +178,26 @@ async function downloadVersionData(conn, versionId) {
   return Buffer.from(await res.arrayBuffer());
 }
 
-
 async function describeObjects(conn) {
   const res = await conn.describeGlobal();
+  const noisySuffixes = ['Share', 'History', 'Feed', 'ChangeEvent', 'Tag', 'Vote'];
   return (res.sobjects || [])
-    .filter((o) => o.queryable && !o.name.endsWith('ChangeEvent') && !o.name.endsWith('History') && !o.name.endsWith('Feed'))
+    .filter((o) => {
+      if (!o.queryable) return false;
+      for (const suffix of noisySuffixes) {
+        if (o.name.endsWith(suffix)) return false;
+      }
+      return true;
+    })
     .map((o) => ({
       name: o.name,
       label: o.label || o.name,
       custom: Boolean(o.custom),
     }))
-    .sort((a, b) => (a.label || a.name).localeCompare(b.label || b.name));
+    .sort((a, b) => {
+      if (a.custom !== b.custom) return a.custom ? -1 : 1;
+      return (a.label || a.name).localeCompare(b.label || b.name);
+    });
 }
 
 async function describeFields(conn, objectName) {
@@ -203,18 +205,23 @@ async function describeFields(conn, objectName) {
     throw new HttpError(400, 'Invalid object name.');
   }
   const meta = await conn.describe(objectName);
-  const supportsFiles = meta.childRelationships
-    ? meta.childRelationships.some(
-        (r) => r.relationshipName === 'ContentDocumentLinks' || r.childSObject === 'ContentDocumentLink'
-      )
-    : true;
+  const supportsFiles = Boolean(
+    meta.childRelationships &&
+    meta.childRelationships.some(
+      (r) => r.relationshipName === 'ContentDocumentLinks' || r.childSObject === 'ContentDocumentLink'
+    )
+  );
 
-  const fields = (meta.fields || []).map((f) => ({
-    name: f.name,
-    label: f.label || f.name,
-    type: f.type || 'string',
-    nameField: Boolean(f.nameField),
-  }));
+  const allowedTypes = new Set(['string', 'email', 'picklist', 'phone', 'textarea', 'url', 'combobox']);
+
+  const fields = (meta.fields || [])
+    .filter((f) => allowedTypes.has((f.type || '').toLowerCase()))
+    .map((f) => ({
+      name: f.name,
+      label: f.label || f.name,
+      type: (f.type || 'string').toLowerCase(),
+      nameField: Boolean(f.nameField || f.name === 'Name'),
+    }));
 
   return {
     label: meta.label || objectName,
