@@ -125,6 +125,23 @@ async function processJob(job) {
   const { id: jobId, deliveryId, campaignId, userId, studentId, recipientEmail, certificateId } = job;
 
   try {
+    // 0. Double-send check: verify delivery has not already been completed
+    const delivery = await store.getDelivery(deliveryId, userId);
+    if (delivery && (delivery.status === 'sent' || delivery.status === 'delivered')) {
+      console.warn(`[Queue] Delivery ${deliveryId} is already '${delivery.status}'. Skipping duplicate send.`);
+      await store.completeJob(jobId, deliveryId, delivery.providerMessageId || 'already-sent');
+      return;
+    }
+
+    // Guard against rapid duplicate sends to the same student within 30 seconds (race-condition protection)
+    const user = await store.getUser(userId);
+    const recentSent = user?.sent?.[studentId];
+    if (recentSent && (Date.now() - Number(recentSent.at || 0) < 30_000)) {
+      console.warn(`[Queue] Student ${studentId} was already sent an email ${Math.round((Date.now() - recentSent.at) / 1000)}s ago. Skipping duplicate send.`);
+      await store.completeJob(jobId, deliveryId, 'duplicate-cooldown-skipped');
+      return;
+    }
+
     // 1. Suppression check
     const suppressed = await store.isSuppressed(userId, recipientEmail);
     if (suppressed) {
@@ -245,7 +262,16 @@ async function processJob(job) {
         payload.replyTo = { email: s.replyTo };
       }
       if (s.cc) {
-        const ccList = s.cc.split(',').map((c) => ({ email: c.trim() })).filter((c) => c.email);
+        const studentEmailLower = student.email.trim().toLowerCase();
+        const seenCc = new Set([studentEmailLower]);
+        const ccList = [];
+        for (const c of s.cc.split(',')) {
+          const email = c.trim().toLowerCase();
+          if (email && !seenCc.has(email)) {
+            seenCc.add(email);
+            ccList.push({ email });
+          }
+        }
         if (ccList.length > 0) payload.cc = ccList;
       }
 
@@ -269,11 +295,29 @@ async function processJob(job) {
       responseDetails = 'Accepted by Brevo REST API (HTTPS)';
     } else {
       const fromAddress = s.fromEmail || s.smtpUser;
+      const studentEmailLower = student.email.trim().toLowerCase();
+      let filteredCc = undefined;
+      if (s.cc) {
+        const seenCc = new Set([studentEmailLower]);
+        const ccArray = [];
+        for (const c of s.cc.split(',')) {
+          const email = c.trim();
+          const emailLower = email.toLowerCase();
+          if (emailLower && !seenCc.has(emailLower)) {
+            seenCc.add(emailLower);
+            ccArray.push(email);
+          }
+        }
+        if (ccArray.length > 0) {
+          filteredCc = ccArray.join(', ');
+        }
+      }
+
       const info = await transport.sendMail({
         from: `"${(s.fromName || fromAddress).replace(/"/g, '')}" <${fromAddress}>`,
         replyTo: s.replyTo || undefined,
         to: student.email,
-        cc: s.cc || undefined,
+        cc: filteredCc,
         subject: subjectLine,
         html,
         text: htmlToText(fillTemplate(bodyTemplate, { ...htmlVars, logoSrc: '' })),

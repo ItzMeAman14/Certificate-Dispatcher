@@ -186,3 +186,41 @@ test('Suppressions: Auto-skip hard-bounced addresses', async () => {
   assert.equal(await store.isSuppressed(user.id, badEmail), true);
 });
 
+test('Store: Duplicate job prevention on multiple rapid queue requests for same delivery', async () => {
+  const user = await store.createUser({
+    email: `dup-test-${Date.now()}@example.com`,
+    name: 'Duplicate Tester',
+    passwordHash: 'hash',
+  });
+
+  const item = {
+    studentId: 'STU_DUP_1',
+    studentName: 'Duplicate Test Student',
+    recipientEmail: 'dup@example.com',
+  };
+
+  // First queue
+  const res1 = await store.createDeliveriesAndJobsAtomic({
+    userId: user.id,
+    items: [item],
+  });
+
+  // Second rapid queue with identical item
+  const res2 = await store.createDeliveriesAndJobsAtomic({
+    userId: user.id,
+    items: [item],
+  });
+
+  assert.equal(res1.deliveries[0].id, res2.deliveries[0].id);
+
+  const delivery = await store.getDelivery(res1.deliveries[0].id, user.id);
+  assert.ok(delivery);
+  assert.equal(delivery.status, 'queued');
+
+  // Verify that only 1 job exists in store for this delivery
+  const runnable = await store.fetchRunnableJobs(500);
+  const matching = runnable.filter((j) => j.deliveryId === delivery.id);
+  assert.equal(matching.length, 1);
+});
+
+

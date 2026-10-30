@@ -731,9 +731,24 @@ app.post('/api/campaigns/queue', requireAuth, wrap(async (req, res) => {
     throw new HttpError(409, 'Please configure your sender email in Settings first.', 'NO_EMAIL_SETTINGS');
   }
 
+  // Deduplicate items by studentId to prevent accidental duplicate recipients in a single campaign
+  const seenStudentIds = new Set();
+  const deduplicatedItems = [];
+  for (const item of items) {
+    const sId = String(item.studentId || item.Id || '');
+    if (sId && !seenStudentIds.has(sId)) {
+      seenStudentIds.add(sId);
+      deduplicatedItems.push(item);
+    }
+  }
+
+  if (deduplicatedItems.length === 0) {
+    throw new HttpError(400, 'No valid recipients provided to queue.');
+  }
+
   // Quota calculation
   const quota = store.getQuota(req.user);
-  let toSend = items;
+  let toSend = deduplicatedItems;
   let leftForLater = 0;
 
   if (quota.limit > 0) {

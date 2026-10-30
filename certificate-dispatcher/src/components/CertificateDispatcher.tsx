@@ -317,6 +317,7 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
   const [activeCampaign, setActiveCampaign] = useState<CampaignProgress | null>(null);
   const [isQueueing, setIsQueueing] = useState(false);
   const [isRetrying, setIsRetrying] = useState(false);
+  const [sendingStudentIds, setSendingStudentIds] = useState<Set<string>>(new Set());
 
   // Modals
   const [template, setTemplate] = useState<EmailTemplate>(getDefaultTemplate);
@@ -616,12 +617,21 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
 
   /** Scale to 500 students: queues jobs in NeonDB background worker */
   const queueCampaign = async (targets: StudentRow[]) => {
-    if (targets.length === 0) return;
+    // Filter out targets that are already currently being queued/sent
+    const pendingTargets = targets.filter((t) => !sendingStudentIds.has(t.student.Id));
+    if (pendingTargets.length === 0) return;
+
+    // Immediately track in-flight target IDs to prevent rapid double-clicks
+    setSendingStudentIds((prev) => {
+      const next = new Set(prev);
+      pendingTargets.forEach((t) => next.add(t.student.Id));
+      return next;
+    });
     setIsQueueing(true);
     setAlertNotice(null);
 
     try {
-      const items = targets.map((t) => ({
+      const items = pendingTargets.map((t) => ({
         studentId: t.student.Id,
         studentName: t.student.Name,
         recipientEmail: t.student.Email__c,
@@ -675,7 +685,7 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
       // Clear selections for queued students
       setSelectedIds((prev) => {
         const next = new Set(prev);
-        targets.forEach((t) => next.delete(t.student.Id));
+        pendingTargets.forEach((t) => next.delete(t.student.Id));
         return next;
       });
 
@@ -687,6 +697,11 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
       });
     } finally {
       setIsQueueing(false);
+      setSendingStudentIds((prev) => {
+        const next = new Set(prev);
+        pendingTargets.forEach((t) => next.delete(t.student.Id));
+        return next;
+      });
     }
   };
 
@@ -1301,7 +1316,9 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
                   pagedRows.map(({ student, certificate }) => {
                     const record = deliveriesMap[student.Id];
                     const isSelected = selectedIds.has(student.Id);
+                    const isSendingThis = sendingStudentIds.has(student.Id);
                     const isQueuedOrSending = record?.status === 'queued' || record?.status === 'sending';
+                    const isRowBusy = isSendingThis || isQueuedOrSending;
 
                     return (
                       <tr
@@ -1314,7 +1331,7 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
                           <Checkbox
                             checked={isSelected}
                             onChange={() => toggleOne(student.Id)}
-                            disabled={!certificate || isQueuedOrSending}
+                            disabled={!certificate || isRowBusy || isQueueing}
                             aria-label={`Select ${student.Name}`}
                           />
                         </td>
@@ -1356,21 +1373,39 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
                           <button
                             type="button"
                             onClick={() => certificate && void queueCampaign([{ student, certificate }])}
-                            disabled={!certificate || isQueuedOrSending || !canSend}
+                            disabled={!certificate || isRowBusy || isQueueing || !canSend}
                             className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium shadow-xs transition cursor-pointer ${
-                              Boolean(student.SentAt) || record?.status === 'sent' || record?.status === 'delivered'
+                              isRowBusy
+                                ? 'border border-slate-200 bg-slate-100 text-slate-500 cursor-not-allowed'
+                                : Boolean(student.SentAt) || record?.status === 'sent' || record?.status === 'delivered'
                                 ? 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
                                 : record?.status === 'failed' || record?.status === 'bounced'
                                 ? 'border border-red-200 bg-red-50 text-red-700 hover:bg-red-100'
                                 : 'bg-indigo-600 text-white hover:bg-indigo-700 disabled:bg-slate-200 disabled:text-slate-400'
                             }`}
                           >
-                            <Send className="h-3 w-3" />
-                            {Boolean(student.SentAt) || record?.status === 'sent' || record?.status === 'delivered'
-                              ? 'Resend'
-                              : record?.status === 'failed' || record?.status === 'bounced'
-                              ? 'Retry'
-                              : 'Send'}
+                            {isSendingThis ? (
+                              <>
+                                <Loader2 className="h-3 w-3 animate-spin text-indigo-600" />
+                                <span>Sending…</span>
+                              </>
+                            ) : isQueuedOrSending ? (
+                              <>
+                                <Loader2 className="h-3 w-3 animate-spin text-slate-400" />
+                                <span>{record?.status === 'sending' ? 'Sending…' : 'Queued…'}</span>
+                              </>
+                            ) : (
+                              <>
+                                <Send className="h-3 w-3" />
+                                <span>
+                                  {Boolean(student.SentAt) || record?.status === 'sent' || record?.status === 'delivered'
+                                    ? 'Resend'
+                                    : record?.status === 'failed' || record?.status === 'bounced'
+                                    ? 'Retry'
+                                    : 'Send'}
+                                </span>
+                              </>
+                            )}
                           </button>
                         </td>
                       </tr>

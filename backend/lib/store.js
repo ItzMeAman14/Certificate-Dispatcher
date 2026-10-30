@@ -811,7 +811,7 @@ async function createDeliveriesAndJobsAtomic({ userId, campaignId, items, subjec
   for (const item of items) {
     const deliveryId = randomToken(16);
     const jobId = randomToken(16);
-    const idempotencyKey = item.idempotencyKey || `${campaignId || 'direct'}_${item.studentId}_${item.recipientEmail}`;
+    const idempotencyKey = item.idempotencyKey || `${userId}_${campaignId || 'direct'}_${item.studentId}_${item.recipientEmail}`;
 
     const delivery = {
       id: deliveryId,
@@ -869,7 +869,7 @@ async function createDeliveriesAndJobsAtomic({ userId, campaignId, items, subjec
         const d = deliveries[i];
         const j = jobs[i];
 
-        await client.query(
+        const dRes = await client.query(
           `INSERT INTO cd_email_deliveries
            (id, user_id, campaign_id, student_id, student_name, recipient_email, certificate_id, certificate_name, subject, status, idempotency_key, attempts, max_attempts, queued_at, created_at, updated_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
@@ -879,7 +879,7 @@ async function createDeliveriesAndJobsAtomic({ userId, campaignId, items, subjec
              error_message = null,
              queued_at = $14,
              updated_at = $16
-           RETURNING id`,
+           RETURNING id, status`,
           [
             d.id,
             d.userId,
@@ -899,12 +899,18 @@ async function createDeliveriesAndJobsAtomic({ userId, campaignId, items, subjec
             d.updatedAt,
           ]
         );
+        const actualDeliveryId = dRes.rows[0]?.id || d.id;
+        d.id = actualDeliveryId;
 
         await client.query(
           `INSERT INTO cd_email_jobs
            (id, delivery_id, campaign_id, user_id, status, run_at, attempts, max_attempts, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-          [j.id, d.id, j.campaignId, j.userId, j.status, j.runAt, j.attempts, j.maxAttempts, j.createdAt, j.updatedAt]
+           SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+           WHERE NOT EXISTS (
+             SELECT 1 FROM cd_email_jobs
+             WHERE delivery_id = $2 AND status IN ('pending', 'processing')
+           )`,
+          [j.id, actualDeliveryId, j.campaignId, j.userId, j.status, j.runAt, j.attempts, j.maxAttempts, j.createdAt, j.updatedAt]
         );
       }
 
@@ -919,8 +925,33 @@ async function createDeliveriesAndJobsAtomic({ userId, campaignId, items, subjec
     return { deliveries, jobs };
   }
 
-  deliveries.forEach((d) => (fileDb.deliveries[d.id] = d));
-  jobs.forEach((j) => (fileDb.jobs[j.id] = j));
+  for (let i = 0; i < deliveries.length; i++) {
+    const d = deliveries[i];
+    const j = jobs[i];
+
+    const existingD = Object.values(fileDb.deliveries).find(
+      (item) => item.idempotencyKey === d.idempotencyKey
+    );
+    if (existingD) {
+      existingD.status = 'queued';
+      existingD.attempts = 0;
+      existingD.errorMessage = null;
+      existingD.queuedAt = now;
+      existingD.updatedAt = now;
+      deliveries[i] = existingD;
+    } else {
+      fileDb.deliveries[d.id] = d;
+    }
+
+    const targetDeliveryId = deliveries[i].id;
+    const activeJob = Object.values(fileDb.jobs).find(
+      (item) => item.deliveryId === targetDeliveryId && (item.status === 'pending' || item.status === 'processing')
+    );
+    if (!activeJob) {
+      j.deliveryId = targetDeliveryId;
+      fileDb.jobs[j.id] = j;
+    }
+  }
   persistFileDb();
   return { deliveries, jobs };
 }
