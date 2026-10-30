@@ -1,6 +1,7 @@
 /** Where the Node server runs. Override with VITE_API_URL in a .env file for deployments. */
-export const API_BASE: string =
+const rawApiBase: string =
   (import.meta.env.VITE_API_URL as string | undefined) ?? 'http://localhost:3000';
+export const API_BASE: string = rawApiBase.replace(/\/+$/, '');
 
 export type ConnectMethod = 'client_credentials' | 'access_token' | 'password';
 
@@ -116,22 +117,55 @@ export class ApiError extends Error {
   }
 }
 
+const TOKEN_KEY = 'cd_session_token';
+
+export function getSessionToken(): string | null {
+  try {
+    return localStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setSessionToken(token: string | null): void {
+  try {
+    if (token) {
+      localStorage.setItem(TOKEN_KEY, token);
+    } else {
+      localStorage.removeItem(TOKEN_KEY);
+    }
+  } catch {
+    // ignore
+  }
+}
+
 interface Options {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
   body?: unknown;
   signal?: AbortSignal;
+  headers?: Record<string, string>;
 }
 
-/** fetch wrapper: sends the login cookie, parses JSON and throws ApiError with a readable message. */
+/** fetch wrapper: sends login cookie & bearer token, parses JSON and throws ApiError with a readable message. */
 export async function api<T = { success: true }>(path: string, options: Options = {}): Promise<T> {
-  const { method = 'GET', body, signal } = options;
+  const { method = 'GET', body, signal, headers: customHeaders } = options;
+
+  const reqHeaders: Record<string, string> = { ...customHeaders };
+  if (body !== undefined) {
+    reqHeaders['Content-Type'] = 'application/json';
+  }
+
+  const token = getSessionToken();
+  if (token) {
+    reqHeaders['Authorization'] = `Bearer ${token}`;
+  }
 
   let res: Response;
   try {
     res = await fetch(`${API_BASE}${path}`, {
       method,
       credentials: 'include',
-      headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+      headers: reqHeaders,
       body: body === undefined ? undefined : JSON.stringify(body),
       signal,
     });
@@ -141,8 +175,17 @@ export async function api<T = { success: true }>(path: string, options: Options 
   }
 
   const data = (await res.json().catch(() => null)) as
-    | ({ success?: boolean; error?: string; code?: string } & Record<string, unknown>)
+    | ({ success?: boolean; error?: string; code?: string; token?: string } & Record<string, unknown>)
     | null;
+
+  // Persist session token if returned by the server
+  if (data && typeof data === 'object' && typeof data.token === 'string') {
+    setSessionToken(data.token);
+  }
+
+  if (res.status === 401) {
+    setSessionToken(null);
+  }
 
   if (!res.ok || !data || data.success === false) {
     throw new ApiError(res.status, data?.error ?? `Request failed (${res.status})`, data?.code);

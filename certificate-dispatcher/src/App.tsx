@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { AlertTriangle, Loader2 } from 'lucide-react';
-import { ApiError, api, errorText } from './api.ts';
+import { ApiError, api, errorText, setSessionToken } from './api.ts';
 import type { Me } from './api.ts';
 import AuthScreen from './components/AuthScreen';
 import CertificateDispatcher from './components/CertificateDispatcher';
@@ -33,11 +33,15 @@ export default function App() {
     try {
       await api('/api/auth/logout', { method: 'POST' });
     } finally {
+      setSessionToken(null);
       setState({ status: 'signed-out' });
     }
   }, []);
 
-  const handleUnauthorized = useCallback(() => setState({ status: 'signed-out' }), []);
+  const handleUnauthorized = useCallback(() => {
+    setSessionToken(null);
+    setState({ status: 'signed-out' });
+  }, []);
   const handleMeChange = useCallback((me: Me) => setState({ status: 'ready', me }), []);
 
   if (state.status === 'loading') {

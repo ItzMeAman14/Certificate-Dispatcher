@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { AlertTriangle, Loader2, Mail } from 'lucide-react';
-import { api, errorText } from '../api.ts';
+import { api, errorText, setSessionToken } from '../api.ts';
 
 interface Props {
   onAuthenticated: () => void;
@@ -29,10 +29,13 @@ export default function AuthScreen({ onAuthenticated }: Props) {
     setBusy(true);
     setError(null);
     try {
-      await api(mode === 'login' ? '/api/auth/login' : '/api/auth/signup', {
+      const res = await api<{ success: true; token?: string }>(mode === 'login' ? '/api/auth/login' : '/api/auth/signup', {
         method: 'POST',
         body: mode === 'login' ? { email, password } : { name, email, password },
       });
+      if (res?.token) {
+        setSessionToken(res.token);
+      }
       onAuthenticated();
     } catch (err) {
       setError(errorText(err));

@@ -64,8 +64,13 @@ function parseCookies(header = '') {
 }
 
 function setSessionCookie(res, token, maxAgeMs) {
-  const flags = ['HttpOnly', 'Path=/', 'SameSite=Lax', `Max-Age=${Math.floor(maxAgeMs / 1000)}`];
-  if (COOKIE_SECURE) flags.push('Secure');
+  const isProd =
+    process.env.NODE_ENV === 'production' ||
+    Boolean(process.env.RENDER) ||
+    COOKIE_SECURE;
+  const sameSite = isProd ? 'SameSite=None' : 'SameSite=Lax';
+  const flags = ['HttpOnly', 'Path=/', sameSite, `Max-Age=${Math.floor(maxAgeMs / 1000)}`];
+  if (isProd) flags.push('Secure');
   res.setHeader('Set-Cookie', `${COOKIE_NAME}=${token}; ${flags.join('; ')}`);
 }
 
@@ -205,7 +210,10 @@ function getTransport(user) {
 
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', process.env.TRUST_PROXY === 'true');
+app.set(
+  'trust proxy',
+  process.env.TRUST_PROXY === 'true' || Boolean(process.env.RENDER) || process.env.NODE_ENV === 'production' ? 1 : false
+);
 
 app.use(
   helmet({
@@ -220,7 +228,39 @@ app.use((_req, res, next) => {
   next();
 });
 
-app.use(cors({ origin: CLIENT_ORIGIN, credentials: true }));
+const allowedOrigins = CLIENT_ORIGIN
+  .split(',')
+  .map((o) => o.trim().replace(/\/+$/, ''))
+  .filter(Boolean);
+
+function isOriginAllowed(origin) {
+  if (!origin) return true;
+  const clean = origin.trim().replace(/\/+$/, '');
+  if (allowedOrigins.includes(clean) || allowedOrigins.includes('*')) return true;
+  try {
+    const url = new URL(clean);
+    // Automatically trust Vercel deployments
+    if (url.hostname.endsWith('.vercel.app')) return true;
+  } catch {
+    // ignore invalid URL
+  }
+  return false;
+}
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || isOriginAllowed(origin)) {
+        callback(null, true);
+      } else {
+        callback(null, false);
+      }
+    },
+    credentials: true,
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Token', 'X-Requested-With'],
+    exposedHeaders: ['Set-Cookie'],
+  })
+);
 
 app.use((req, res, next) => {
   // Extra CSRF guard: state-changing requests must come from the UI's origin.
@@ -228,7 +268,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/api/webhooks')) return next();
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
   const origin = req.get('origin');
-  if (origin && origin !== CLIENT_ORIGIN) {
+  if (origin && !isOriginAllowed(origin)) {
     return res.status(403).json({ success: false, error: 'Origin not allowed' });
   }
   next();
@@ -244,8 +284,24 @@ app.use(
   })
 );
 
+function extractToken(req) {
+  const authHeader = req.headers.authorization;
+  if (authHeader && typeof authHeader === 'string') {
+    const match = authHeader.match(/^Bearer\s+(.+)$/i);
+    if (match && match[1]) return match[1].trim();
+  }
+  if (req.headers['x-session-token']) {
+    return String(req.headers['x-session-token']).trim();
+  }
+  if (req.headers.cookie) {
+    const cookies = parseCookies(req.headers.cookie);
+    if (cookies[COOKIE_NAME]) return cookies[COOKIE_NAME];
+  }
+  return null;
+}
+
 async function currentUser(req) {
-  const token = parseCookies(req.headers.cookie)[COOKIE_NAME];
+  const token = extractToken(req);
   if (!token) return null;
   const session = await store.getSession(sha256(token));
   if (!session || session.expiresAt < Date.now()) return null;
@@ -290,7 +346,7 @@ app.post('/api/auth/signup', wrap(async (req, res) => {
   const user = await store.createUser({ email, name, passwordHash: await hashPassword(password) });
   const token = await store.createSession(user.id, SESSION_MS);
   setSessionCookie(res, token, SESSION_MS);
-  res.status(201).json({ success: true });
+  res.status(201).json({ success: true, token, ...meResponse(user) });
 }));
 
 app.post('/api/auth/login', wrap(async (req, res) => {
@@ -312,11 +368,11 @@ app.post('/api/auth/login', wrap(async (req, res) => {
   loginLimiter.clear(key);
   const token = await store.createSession(user.id, SESSION_MS);
   setSessionCookie(res, token, SESSION_MS);
-  res.json({ success: true });
+  res.json({ success: true, token, ...meResponse(user) });
 }));
 
 app.post('/api/auth/logout', wrap(async (req, res) => {
-  const token = parseCookies(req.headers.cookie)[COOKIE_NAME];
+  const token = extractToken(req);
   if (token) await store.deleteSession(sha256(token));
   setSessionCookie(res, '', 0);
   res.json({ success: true });
