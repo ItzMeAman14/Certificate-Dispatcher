@@ -223,4 +223,32 @@ test('Store: Duplicate job prevention on multiple rapid queue requests for same 
   assert.equal(matching.length, 1);
 });
 
+test('Conditional SMTP transport: Special sender whitelist routes to Gmail, others to default', async () => {
+  const queue = require('../lib/queue');
+
+  // Verify whitelist check
+  assert.equal(queue.isSpecialGmailSender('aman@astreait.com'), true);
+  assert.equal(queue.isSpecialGmailSender('Aman@astreait.com'), true);
+  assert.equal(queue.isSpecialGmailSender('manvi@astreait.com'), true);
+  assert.equal(queue.isSpecialGmailSender('MANVI@ASTREAIT.COM'), true);
+  assert.equal(queue.isSpecialGmailSender('other@example.com'), false);
+
+  // Set up mock Gmail env vars
+  const origUser = process.env.GMAIL_USER;
+  const origPass = process.env.GMAIL_APP_PASSWORD;
+  process.env.GMAIL_USER = 'sender@gmail.com';
+  process.env.GMAIL_APP_PASSWORD = 'app-password-16';
+
+  try {
+    const gmailTransport = queue.getGmailTransport();
+    assert.ok(gmailTransport);
+    assert.equal(gmailTransport.options.host, 'smtp.gmail.com');
+    assert.equal(gmailTransport.options.auth.user, 'sender@gmail.com');
+    assert.equal(gmailTransport.options.auth.pass, 'app-password-16');
+  } finally {
+    process.env.GMAIL_USER = origUser;
+    process.env.GMAIL_APP_PASSWORD = origPass;
+  }
+});
+
 

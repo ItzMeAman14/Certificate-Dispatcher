@@ -905,10 +905,10 @@ async function createDeliveriesAndJobsAtomic({ userId, campaignId, items, subjec
         await client.query(
           `INSERT INTO cd_email_jobs
            (id, delivery_id, campaign_id, user_id, status, run_at, attempts, max_attempts, created_at, updated_at)
-           SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+           SELECT $1::varchar, $2::varchar, $3::varchar, $4::varchar, $5::varchar, $6::bigint, $7::int, $8::int, $9::bigint, $10::bigint
            WHERE NOT EXISTS (
              SELECT 1 FROM cd_email_jobs
-             WHERE delivery_id = $2 AND status IN ('pending', 'processing')
+             WHERE delivery_id = $2::varchar AND status IN ('pending', 'processing')
            )`,
           [j.id, actualDeliveryId, j.campaignId, j.userId, j.status, j.runAt, j.attempts, j.maxAttempts, j.createdAt, j.updatedAt]
         );

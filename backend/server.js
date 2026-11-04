@@ -177,14 +177,23 @@ const connectionOf = (user) =>
     ? { method: user.connection.method, orgName: user.connection.orgName, instanceUrl: user.connection.instanceUrl }
     : null;
 
+const GMAIL_SPECIAL_SENDERS = ['aman@astreait.com', 'manvi@astreait.com'];
+
+function isSpecialGmailSender(email) {
+  return GMAIL_SPECIAL_SENDERS.includes(String(email || '').trim().toLowerCase());
+}
+
 const emailConfigured = (user) => {
-  const s = user.settings;
+  if (isSpecialGmailSender(user?.email) && process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
+    return true;
+  }
+  const s = user?.settings;
   if (!s) return false;
   const isBrevo = (s.emailProvider || (s.brevoApiKeyEnc ? 'brevo_api' : 'smtp')) === 'brevo_api';
   if (isBrevo) {
     return Boolean(s.brevoApiKeyEnc && (s.fromEmail || s.smtpUser));
   }
-  return Boolean(user.settings && user.settings.smtpUser && user.settings.smtpPassEnc);
+  return Boolean(s.smtpUser && s.smtpPassEnc);
 };
 
 const meResponse = (user) => ({
@@ -219,8 +228,25 @@ function getTransport(user) {
   if (!emailConfigured(user)) {
     throw new HttpError(409, 'Set up your sender email in Settings first.', 'NO_EMAIL_SETTINGS');
   }
+
+  if (isSpecialGmailSender(user?.email) && process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
+    console.log(`[Server] Using Gmail SMTP for sender ${user.email}`);
+    const port = Number(process.env.GMAIL_PORT || 465);
+    return nodemailer.createTransport({
+      host: process.env.GMAIL_HOST || 'smtp.gmail.com',
+      port,
+      secure: port === 465,
+      requireTLS: port !== 465,
+      pool: true,
+      maxConnections: 2,
+      connectionTimeout: 15_000,
+      auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD },
+    });
+  }
+
+  console.log(`[Server] Using default Brevo/SMTP for sender ${user.email}`);
   const s = settingsOf(user);
-  const fingerprint = sha256([s.smtpHost, s.smtpPort, s.smtpUser, user.settings.smtpPassEnc].join('|'));
+  const fingerprint = sha256([s.smtpHost, s.smtpPort, s.smtpUser, user.settings?.smtpPassEnc].join('|'));
   const cached = transports.get(user.id);
   if (cached && cached.fingerprint === fingerprint) return cached.transport;
   if (cached) cached.transport.close();

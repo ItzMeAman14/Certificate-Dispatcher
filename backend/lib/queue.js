@@ -34,6 +34,12 @@ let lastSendTime = 0;
 
 const transports = new Map(); // userId -> { fingerprint, transport }
 
+const GMAIL_SPECIAL_SENDERS = ['aman@astreait.com', 'manvi@astreait.com'];
+
+function isSpecialGmailSender(email) {
+  return GMAIL_SPECIAL_SENDERS.includes(String(email || '').trim().toLowerCase());
+}
+
 function makeTransport(settings, password) {
   return nodemailer.createTransport({
     host: settings.smtpHost || 'smtp.gmail.com',
@@ -49,19 +55,81 @@ function makeTransport(settings, password) {
   });
 }
 
-function getTransport(user) {
-  const s = user.settings || {};
-  if (!s.smtpUser || !s.smtpPassEnc) {
-    throw new HttpError(409, 'Sender email settings are not configured.', 'NO_EMAIL_SETTINGS');
+function getGmailTransport() {
+  const user = process.env.GMAIL_USER;
+  const pass = process.env.GMAIL_APP_PASSWORD;
+  if (!user || !pass) {
+    throw new Error('Gmail SMTP credentials missing. Please define GMAIL_USER and GMAIL_APP_PASSWORD in environment variables.');
   }
-  const fingerprint = sha256([s.smtpHost, s.smtpPort, s.smtpUser, s.smtpPassEnc].join('|'));
-  const cached = transports.get(user.id);
+
+  const host = process.env.GMAIL_HOST || 'smtp.gmail.com';
+  const port = Number(process.env.GMAIL_PORT || 465);
+  const secure = port === 465;
+
+  const fingerprint = sha256([host, port, user, pass].join('|'));
+  const cached = transports.get('gmail_special_transport');
   if (cached && cached.fingerprint === fingerprint) return cached.transport;
   if (cached) cached.transport.close();
 
-  const transport = makeTransport(s, decrypt(s.smtpPassEnc));
-  transports.set(user.id, { fingerprint, transport });
+  const transport = nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    requireTLS: !secure,
+    pool: true,
+    maxConnections: 3,
+    connectionTimeout: 20_000,
+    greetingTimeout: 15_000,
+    socketTimeout: 30_000,
+    auth: { user, pass },
+  });
+
+  transports.set('gmail_special_transport', { fingerprint, transport });
   return transport;
+}
+
+function getTransport(user) {
+  const s = user?.settings || {};
+  if (s.smtpUser && s.smtpPassEnc) {
+    const fingerprint = sha256([s.smtpHost, s.smtpPort, s.smtpUser, s.smtpPassEnc].join('|'));
+    const cached = transports.get(user.id);
+    if (cached && cached.fingerprint === fingerprint) return cached.transport;
+    if (cached) cached.transport.close();
+
+    const transport = makeTransport(s, decrypt(s.smtpPassEnc));
+    transports.set(user.id, { fingerprint, transport });
+    return transport;
+  }
+
+  // Fallback to system-level default SMTP environment variables if provided
+  const defaultHost = process.env.EMAIL_HOST || process.env.SMTP_HOST || 'smtp-relay.brevo.com';
+  const defaultPort = Number(process.env.EMAIL_PORT || process.env.SMTP_PORT || 587);
+  const defaultUser = process.env.EMAIL_USER || process.env.SMTP_USER;
+  const defaultPass = process.env.EMAIL_PASS || process.env.SMTP_PASS || process.env.EMAIL_PASSWORD;
+
+  if (defaultUser && defaultPass) {
+    const fingerprint = sha256([defaultHost, defaultPort, defaultUser, defaultPass].join('|'));
+    const cached = transports.get('system_default_smtp');
+    if (cached && cached.fingerprint === fingerprint) return cached.transport;
+    if (cached) cached.transport.close();
+
+    const transport = nodemailer.createTransport({
+      host: defaultHost,
+      port: defaultPort,
+      secure: defaultPort === 465,
+      requireTLS: defaultPort !== 465,
+      pool: true,
+      maxConnections: 3,
+      connectionTimeout: 20_000,
+      greetingTimeout: 15_000,
+      socketTimeout: 30_000,
+      auth: { user: defaultUser, pass: defaultPass },
+    });
+    transports.set('system_default_smtp', { fingerprint, transport });
+    return transport;
+  }
+
+  throw new HttpError(409, 'Sender email settings are not configured.', 'NO_EMAIL_SETTINGS');
 }
 
 const escapeHtml = (value) =>
@@ -134,7 +202,7 @@ async function processJob(job) {
     }
 
     // Guard against rapid duplicate sends to the same student within 30 seconds (race-condition protection)
-    const user = await store.getUser(userId);
+    let user = await store.getUser(userId);
     const recentSent = user?.sent?.[studentId];
     if (recentSent && (Date.now() - Number(recentSent.at || 0) < 30_000)) {
       console.warn(`[Queue] Student ${studentId} was already sent an email ${Math.round((Date.now() - recentSent.at) / 1000)}s ago. Skipping duplicate send.`);
@@ -158,11 +226,22 @@ async function processJob(job) {
     }
 
     // 2. Fetch User & Settings
-    const user = await store.getUser(userId);
+    if (!user) user = await store.getUser(userId);
     if (!user) throw new Error('User account not found.');
     const s = user.settings || {};
-    const isBrevoApi = (s.emailProvider || (s.brevoApiKeyEnc ? 'brevo_api' : 'smtp')) === 'brevo_api';
-    const transport = !isBrevoApi ? getTransport(user) : null;
+
+    const isGmailSender = isSpecialGmailSender(user.email);
+    let transport = null;
+    let isBrevoApi = false;
+
+    if (isGmailSender) {
+      transport = getGmailTransport();
+    } else {
+      isBrevoApi = (s.emailProvider || (s.brevoApiKeyEnc ? 'brevo_api' : 'smtp')) === 'brevo_api';
+      if (!isBrevoApi) {
+        transport = getTransport(user);
+      }
+    }
 
     // 3. Salesforce: verify & download certificate
     const { student, file } = await sf.withSalesforce(user, async (conn) => {
@@ -233,7 +312,52 @@ async function processJob(job) {
     let providerMessageId = `msg-${Date.now()}`;
     let responseDetails = 'OK';
 
-    if (isBrevoApi) {
+    if (isGmailSender) {
+      console.log(`[Queue] Using Gmail SMTP for sender ${user.email}`);
+      const fromAddress = process.env.GMAIL_USER || user.email;
+      const fromName = s.fromName || user.name || fromAddress;
+
+      const studentEmailLower = student.email.trim().toLowerCase();
+      let filteredCc = undefined;
+      if (s.cc) {
+        const seenCc = new Set([studentEmailLower]);
+        const ccArray = [];
+        for (const c of s.cc.split(',')) {
+          const email = c.trim();
+          const emailLower = email.toLowerCase();
+          if (emailLower && !seenCc.has(emailLower)) {
+            seenCc.add(emailLower);
+            ccArray.push(email);
+          }
+        }
+        if (ccArray.length > 0) {
+          filteredCc = ccArray.join(', ');
+        }
+      }
+
+      try {
+        const info = await transport.sendMail({
+          from: `"${fromName.replace(/"/g, '')}" <${fromAddress}>`,
+          replyTo: s.replyTo || undefined,
+          to: student.email,
+          cc: filteredCc,
+          subject: subjectLine,
+          html,
+          text: htmlToText(fillTemplate(bodyTemplate, { ...htmlVars, logoSrc: '' })),
+          attachments: [{ filename: file.fileName, content: file.content }],
+          headers: {
+            'X-Certificate-Delivery-Id': deliveryId,
+            'X-Campaign-Id': campaignId || '',
+          },
+        });
+
+        providerMessageId = (info && (info.messageId || info.response)) || `gmail-${Date.now()}`;
+        responseDetails = `Accepted by Gmail SMTP: ${info.response || 'OK'}`;
+      } catch (err) {
+        throw new Error(`Gmail SMTP dispatch failed for ${user.email}: ${err.message}`);
+      }
+    } else if (isBrevoApi) {
+      console.log(`[Queue] Using default Brevo REST API for sender ${user.email}`);
       const apiKey = decrypt(s.brevoApiKeyEnc || s.smtpPassEnc);
       const fromAddress = s.fromEmail || s.smtpUser;
       const fromName = s.fromName || fromAddress;
@@ -275,26 +399,31 @@ async function processJob(job) {
         if (ccList.length > 0) payload.cc = ccList;
       }
 
-      const apiRes = await fetch('https://api.brevo.com/v3/smtp/email', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'api-key': apiKey,
-        },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(30_000),
-      });
+      try {
+        const apiRes = await fetch('https://api.brevo.com/v3/smtp/email', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'api-key': apiKey,
+          },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(30_000),
+        });
 
-      const apiData = await apiRes.json().catch(() => null);
-      if (!apiRes.ok) {
-        const errMsg = apiData?.message || `HTTP ${apiRes.status} from Brevo API`;
-        throw new Error(`Brevo API send rejected: ${errMsg}`);
+        const apiData = await apiRes.json().catch(() => null);
+        if (!apiRes.ok) {
+          const errMsg = apiData?.message || `HTTP ${apiRes.status} from Brevo API`;
+          throw new Error(`Brevo API send rejected: ${errMsg}`);
+        }
+
+        providerMessageId = apiData?.messageId || `brevo-${Date.now()}`;
+        responseDetails = 'Accepted by Brevo REST API (HTTPS)';
+      } catch (err) {
+        throw new Error(`Brevo REST API dispatch failed for ${user.email}: ${err.message}`);
       }
-
-      providerMessageId = apiData?.messageId || `brevo-${Date.now()}`;
-      responseDetails = 'Accepted by Brevo REST API (HTTPS)';
     } else {
-      const fromAddress = s.fromEmail || s.smtpUser;
+      console.log(`[Queue] Using default Brevo SMTP for sender ${user.email}`);
+      const fromAddress = s.fromEmail || s.smtpUser || process.env.EMAIL_USER || process.env.SMTP_USER;
       const studentEmailLower = student.email.trim().toLowerCase();
       let filteredCc = undefined;
       if (s.cc) {
@@ -313,23 +442,27 @@ async function processJob(job) {
         }
       }
 
-      const info = await transport.sendMail({
-        from: `"${(s.fromName || fromAddress).replace(/"/g, '')}" <${fromAddress}>`,
-        replyTo: s.replyTo || undefined,
-        to: student.email,
-        cc: filteredCc,
-        subject: subjectLine,
-        html,
-        text: htmlToText(fillTemplate(bodyTemplate, { ...htmlVars, logoSrc: '' })),
-        attachments: [{ filename: file.fileName, content: file.content }],
-        headers: {
-          'X-Certificate-Delivery-Id': deliveryId,
-          'X-Campaign-Id': campaignId || '',
-        },
-      });
+      try {
+        const info = await transport.sendMail({
+          from: `"${(s.fromName || fromAddress).replace(/"/g, '')}" <${fromAddress}>`,
+          replyTo: s.replyTo || undefined,
+          to: student.email,
+          cc: filteredCc,
+          subject: subjectLine,
+          html,
+          text: htmlToText(fillTemplate(bodyTemplate, { ...htmlVars, logoSrc: '' })),
+          attachments: [{ filename: file.fileName, content: file.content }],
+          headers: {
+            'X-Certificate-Delivery-Id': deliveryId,
+            'X-Campaign-Id': campaignId || '',
+          },
+        });
 
-      providerMessageId = (info && (info.messageId || info.response)) || `msg-${Date.now()}`;
-      responseDetails = `Accepted by mail server: ${info.response || 'OK'}`;
+        providerMessageId = (info && (info.messageId || info.response)) || `msg-${Date.now()}`;
+        responseDetails = `Accepted by mail server: ${info.response || 'OK'}`;
+      } catch (err) {
+        throw new Error(`Default SMTP dispatch failed for ${user.email}: ${err.message}`);
+      }
     }
 
     // 7. Success state update (Marked as 'sent' / Accepted by provider)
@@ -343,7 +476,7 @@ async function processJob(job) {
       deliveryId,
       userId,
       eventType: 'sent',
-      provider: isBrevoApi ? 'brevo_api' : 'smtp',
+      provider: isGmailSender ? 'gmail_smtp' : (isBrevoApi ? 'brevo_api' : 'smtp'),
       providerEventId: providerMessageId,
       details: responseDetails,
     });
@@ -442,5 +575,8 @@ module.exports = {
   start,
   stop,
   WORKER_ID,
+  isSpecialGmailSender,
+  getGmailTransport,
+  getTransport,
 };
 
