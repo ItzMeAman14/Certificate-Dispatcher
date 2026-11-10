@@ -6,7 +6,8 @@ const path = require('path');
 const { promisify } = require('util');
 
 const scrypt = promisify(crypto.scrypt);
-const DATA_DIR = path.join(__dirname, '..', 'data');
+const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.LAMBDA_TASK_ROOT);
+const DATA_DIR = isServerless ? path.join('/tmp', 'data') : path.join(__dirname, '..', 'data');
 
 /* ----------------------------- Encryption key ----------------------------- */
 
@@ -20,14 +21,19 @@ function loadKey() {
   }
 
   // Development convenience: generate a key file once. Use APP_ENCRYPTION_KEY in production.
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const keyFile = path.join(DATA_DIR, 'secret.key');
-  if (fs.existsSync(keyFile)) return Buffer.from(fs.readFileSync(keyFile, 'utf8').trim(), 'hex');
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const keyFile = path.join(DATA_DIR, 'secret.key');
+    if (fs.existsSync(keyFile)) return Buffer.from(fs.readFileSync(keyFile, 'utf8').trim(), 'hex');
 
-  const key = crypto.randomBytes(32);
-  fs.writeFileSync(keyFile, key.toString('hex'), { mode: 0o600 });
-  console.warn('APP_ENCRYPTION_KEY is not set, so data/secret.key was generated. Set the env var in production.');
-  return key;
+    const key = crypto.randomBytes(32);
+    fs.writeFileSync(keyFile, key.toString('hex'), { mode: 0o600 });
+    console.warn('APP_ENCRYPTION_KEY is not set, so data/secret.key was generated. Set the env var in production.');
+    return key;
+  } catch (err) {
+    console.warn('Filesystem is read-only and APP_ENCRYPTION_KEY is not set. Using ephemeral in-memory key:', err.message);
+    return crypto.randomBytes(32);
+  }
 }
 
 const KEY = loadKey();

@@ -451,6 +451,17 @@ app.set(
   process.env.TRUST_PROXY === 'true' || Boolean(process.env.RENDER) || process.env.NODE_ENV === 'production' ? 1 : false
 );
 
+// Restore original request URL if rewritten by Vercel serverless router
+app.use((req, _res, next) => {
+  const matchedPath = req.headers['x-vercel-matched-path'] || req.headers['x-matched-path'];
+  if (matchedPath) {
+    req.url = matchedPath;
+  } else if (req.originalUrl && (req.url.startsWith('/server.js') || req.url.startsWith('/api/index'))) {
+    req.url = req.originalUrl;
+  }
+  next();
+});
+
 app.use(
   helmet({
     contentSecurityPolicy: false, // UI is served separately or via API
