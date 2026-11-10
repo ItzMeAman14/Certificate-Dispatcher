@@ -48,9 +48,9 @@ function makeTransport(settings, password) {
     requireTLS: Number(settings.smtpPort || 465) !== 465,
     pool: true,
     maxConnections: 3,
-    connectionTimeout: 20_000,
-    greetingTimeout: 15_000,
-    socketTimeout: 30_000,
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 20_000,
     auth: { user: settings.smtpUser, pass: password },
   });
 }
@@ -78,9 +78,9 @@ function getGmailTransport() {
     requireTLS: !secure,
     pool: true,
     maxConnections: 3,
-    connectionTimeout: 20_000,
-    greetingTimeout: 15_000,
-    socketTimeout: 30_000,
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 20_000,
     auth: { user, pass },
   });
 
@@ -120,9 +120,9 @@ function getTransport(user) {
       requireTLS: defaultPort !== 465,
       pool: true,
       maxConnections: 3,
-      connectionTimeout: 20_000,
-      greetingTimeout: 15_000,
-      socketTimeout: 30_000,
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 20_000,
       auth: { user: defaultUser, pass: defaultPass },
     });
     transports.set('system_default_smtp', { fingerprint, transport });
@@ -188,7 +188,7 @@ function isPermanentError(err) {
 /*                                Job Processing                              */
 /* -------------------------------------------------------------------------- */
 
-async function processJob(job) {
+async function processJob(job, stepIndex = 1, totalSteps = 1) {
   activeJobsCount++;
   const { id: jobId, deliveryId, campaignId, userId, studentId, recipientEmail, certificateId } = job;
 
@@ -198,7 +198,7 @@ async function processJob(job) {
     if (delivery && (delivery.status === 'sent' || delivery.status === 'delivered')) {
       console.warn(`[Queue] Delivery ${deliveryId} is already '${delivery.status}'. Skipping duplicate send.`);
       await store.completeJob(jobId, deliveryId, delivery.providerMessageId || 'already-sent');
-      return;
+      return true;
     }
 
     // Guard against rapid duplicate sends to the same student within 30 seconds (race-condition protection)
@@ -207,7 +207,7 @@ async function processJob(job) {
     if (recentSent && (Date.now() - Number(recentSent.at || 0) < 30_000)) {
       console.warn(`[Queue] Student ${studentId} was already sent an email ${Math.round((Date.now() - recentSent.at) / 1000)}s ago. Skipping duplicate send.`);
       await store.completeJob(jobId, deliveryId, 'duplicate-cooldown-skipped');
-      return;
+      return true;
     }
 
     // 1. Suppression check
@@ -222,7 +222,8 @@ async function processJob(job) {
         details: reason,
       });
       if (campaignId) await store.refreshCampaignStats(campaignId, userId);
-      return;
+      console.error(`[STEP 3/${totalSteps}] ❌ Failed: ${recipientEmail} is on suppression list.`);
+      return false;
     }
 
     // 2. Fetch User & Settings
@@ -244,6 +245,7 @@ async function processJob(job) {
     }
 
     // 3. Salesforce: verify & download certificate
+    console.log(`[STEP 1/${totalSteps}] Fetching PDF attachment for ${recipientEmail || studentId}...`);
     const { student, file } = await sf.withSalesforce(user, async (conn) => {
       const emailField = s.emailField || 'Email__c';
       const nameField = s.nameField || 'Name';
@@ -309,6 +311,7 @@ async function processJob(job) {
     const subjectLine = fillTemplate(job.subject || 'Your certificate', plainVars).replace(/[\r\n]+/g, ' ');
 
     // 6. Send Mail
+    console.log(`[STEP 2/${totalSteps}] Transporter dispatching email to ${student.email}...`);
     let providerMessageId = `msg-${Date.now()}`;
     let responseDetails = 'OK';
 
@@ -484,8 +487,11 @@ async function processJob(job) {
     if (campaignId) {
       await store.refreshCampaignStats(campaignId, userId);
     }
+
+    console.log(`[STEP 3/${totalSteps}] ✅ Sent: Certificate email successfully dispatched to ${student.email} (MessageId: ${providerMessageId})`);
+    return true;
   } catch (err) {
-    console.error(`[Queue] Delivery ${deliveryId} to ${recipientEmail} failed:`, err.message);
+    console.error(`[STEP 3/${totalSteps}] ❌ Failed: Delivery ${deliveryId} to ${recipientEmail} failed:`, err.message);
     const permanent = isPermanentError(err);
     await store.failJob(jobId, deliveryId, err.message, permanent);
 
@@ -504,58 +510,64 @@ async function processJob(job) {
     if (campaignId) {
       await store.refreshCampaignStats(campaignId, userId);
     }
+    return false;
   } finally {
     store.releaseSend(userId, 1);
     activeJobsCount--;
   }
 }
 
+async function processJobsSequentially(jobs) {
+  if (!jobs || jobs.length === 0) return { processed: 0, sent: 0, failed: 0 };
+  const total = jobs.length;
+  console.log(`[BULK START] Total count initialized: ${total} job(s) in queue batch.`);
+
+  let sentCount = 0;
+  let failedCount = 0;
+  let current = 0;
+
+  for (const job of jobs) {
+    current++;
+    try {
+      const ok = await processJob(job, current, total);
+      if (ok) sentCount++;
+      else failedCount++;
+    } catch (iterationErr) {
+      failedCount++;
+      console.error(`[STEP 3/${total}] ❌ Failed: Unhandled iteration exception for ${job.recipientEmail || job.studentId}: ${iterationErr.message}`);
+    }
+
+    // Rate-limiting delay (300-500ms pause) between sends to prevent memory leaks and SMTP rate-limit bans
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+
+  console.log(`[BULK COMPLETE] Final summary: Total: ${total}, Sent: ${sentCount}, Failed: ${failedCount}`);
+  return { processed: total, sent: sentCount, failed: failedCount };
+}
+
 /* -------------------------------------------------------------------------- */
 /*                               Worker Poller                                */
 /* -------------------------------------------------------------------------- */
 
+// Rule 1: No background timers outside requests. The queue poller and all
+// setTimeout loops have been removed. Email sending is demand-driven via
+// /api/campaigns/:id/process with time-budgeted execution.
 async function tick() {
-  if (isStopping) return;
-
-  try {
-    const availableSlots = CONCURRENCY - activeJobsCount;
-    if (availableSlots > 0) {
-      const jobs = await store.fetchRunnableJobs(availableSlots, WORKER_ID);
-      if (jobs.length > 0) {
-        jobs.forEach((j) => {
-          processJob(j).catch((err) => console.error('[Queue] Unhandled job error:', err));
-        });
-      }
-    }
-  } catch (err) {
-    console.error('[Queue] Error polling runnable jobs:', err.message);
-  } finally {
-    if (!isStopping) {
-      const delay = activeJobsCount >= CONCURRENCY ? 500 : 1200;
-      pollTimer = setTimeout(tick, delay);
-    }
-  }
+  return;
 }
 
 function start() {
-  if (isRunning) return;
-  isRunning = true;
-  isStopping = false;
-  console.log(`[Queue] Background worker ${WORKER_ID} started (Concurrency: ${CONCURRENCY}, Max rate: ${RATE_LIMIT_PER_SEC}/s).`);
-  tick();
+  // Rule 1: Background queue poller removed. Nothing runs outside requests.
+  return;
 }
 
 async function stop() {
-  if (!isRunning || isStopping) return;
-  isStopping = true;
-  console.log('[Queue] Worker stopping gracefully, awaiting active jobs to finish...');
-  if (pollTimer) clearTimeout(pollTimer);
-
-  const timeoutMs = 20_000;
-  const startWait = Date.now();
-  while (activeJobsCount > 0 && Date.now() - startWait < timeoutMs) {
-    await new Promise((r) => setTimeout(r, 200));
+  if (pollTimer) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
   }
+  isRunning = false;
+  isStopping = true;
 
   // Close open SMTP transports
   for (const { transport } of transports.values()) {
@@ -566,9 +578,6 @@ async function stop() {
     }
   }
   transports.clear();
-
-  isRunning = false;
-  console.log('[Queue] Worker stopped successfully.');
 }
 
 module.exports = {
@@ -578,5 +587,7 @@ module.exports = {
   isSpecialGmailSender,
   getGmailTransport,
   getTransport,
+  processJob,
+  processJobsSequentially,
 };
 
