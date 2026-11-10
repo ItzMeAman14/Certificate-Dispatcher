@@ -68,7 +68,7 @@ export default function SettingsModal({ settings, onSaved, onUnauthorized, onClo
       emailProvider: 'smtp',
       smtpHost: 'smtp.gmail.com',
       smtpPort: 465,
-      dailyLimit: 0,
+      dailyLimit: 450,
     }));
   };
 
@@ -243,7 +243,7 @@ export default function SettingsModal({ settings, onSaved, onUnauthorized, onClo
 
                 <Field
                   label="Daily send limit"
-                  hint="Emails per rolling 24h. Brevo free plan allows 300/day (250 recommended)."
+                  hint="Emails per rolling 24h. Free Gmail: 500 (450 recommended). Workspace: 2,000 (1,800 recommended). Brevo: 300."
                 >
                   <input
                     type="number"
@@ -336,6 +336,19 @@ export default function SettingsModal({ settings, onSaved, onUnauthorized, onClo
                     />
                   </Field>
                 </div>
+
+                <Field
+                  label="Daily send limit"
+                  hint="Emails per rolling 24h. Free Gmail: 500 (450 recommended). Workspace: 2,000 (1,800 recommended). Brevo: 300."
+                >
+                  <input
+                    type="number"
+                    min="0"
+                    value={form.dailyLimit}
+                    onChange={(e) => set('dailyLimit', Math.max(0, parseInt(e.target.value, 10) || 0))}
+                    className={inputCls}
+                  />
+                </Field>
               </div>
             )}
           </Section>
@@ -364,14 +377,29 @@ export default function SettingsModal({ settings, onSaved, onUnauthorized, onClo
                   className={inputCls}
                 />
               </Field>
-              <Field label="CC (optional)" hint="Separate several emails with commas.">
+              <div>
+                <div className="mb-1.5 flex items-center justify-between">
+                  <label className="text-sm font-medium text-slate-700">CC (optional)</label>
+                  {form.cc && form.cc.trim() && (
+                    <button
+                      type="button"
+                      onClick={() => set('cc', '')}
+                      className="text-xs font-semibold text-rose-600 hover:text-rose-700 hover:underline cursor-pointer"
+                    >
+                      Clear CC
+                    </button>
+                  )}
+                </div>
                 <input
                   value={form.cc}
                   onChange={(e) => set('cc', e.target.value)}
                   placeholder="manager@company.com"
                   className={inputCls}
                 />
-              </Field>
+                <p className="mt-1 text-[11px] text-amber-700 bg-amber-50/80 rounded px-2 py-1 border border-amber-200">
+                  ⚠️ <strong>Warning:</strong> Each CC recipient counts toward your daily limit (e.g. 100 emails with 1 CC consumes 200 of your daily quota).
+                </p>
+              </div>
               <Field label="Reply-to (optional)">
                 <input
                   type="email"

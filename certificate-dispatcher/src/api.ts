@@ -145,6 +145,195 @@ export interface DeliveriesResponse {
   counts: DeliveryCounts;
 }
 
+export type CampaignStatus =
+  | 'draft'
+  | 'running'
+  | 'paused'
+  | 'paused_limit'
+  | 'paused_throttled'
+  | 'paused_auth'
+  | 'paused_salesforce'
+  | 'completed'
+  | 'cancelled'
+  | 'failed';
+
+export interface CampaignCounts {
+  total: number;
+  willSend?: number;
+  pending: number;
+  sending: number;
+  sent: number;
+  failed: number;
+  uncertain: number;
+  skipped: number;
+  cancelled: number;
+}
+
+export interface StepTiming {
+  avgMs: number;
+  p95Ms: number;
+}
+
+export interface TimingSummary {
+  totalTimeMs: number;
+  emailsPerMin: number;
+  steps: {
+    claim: StepTiming;
+    fileDownload: StepTiming;
+    smtpConnect: StepTiming;
+    smtpSend: StepTiming;
+    dbWrite: StepTiming;
+  };
+  timings?: Array<{
+    claimMs: number;
+    fileDownloadMs: number;
+    smtpConnectMs: number;
+    smtpSendMs: number;
+    dbWriteMs: number;
+  }>;
+}
+
+export interface CampaignV2 {
+  id: string;
+  userId: string;
+  name: string;
+  subject: string;
+  templateHtml: string;
+  status: CampaignStatus;
+  pauseReason?: string | null;
+  resumeAt?: number | null;
+  createdAt: number;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+  counts?: CampaignCounts;
+  sendLanes?: number;
+  timingSummary?: TimingSummary | null;
+}
+
+export interface JobEvent {
+  id: number;
+  campaignId: string;
+  jobId: string;
+  studentName: string;
+  studentEmail: string;
+  type:
+    | 'queued'
+    | 'sending'
+    | 'sent'
+    | 'retry_scheduled'
+    | 'failed'
+    | 'uncertain'
+    | 'throttled'
+    | 'paused'
+    | 'resumed'
+    | 'cancelled'
+    | 'completed'
+    | 'skipped'
+    | 'auth_error';
+  message: string;
+  createdAt: string;
+}
+
+export interface EventsSummary {
+  sent: number;
+  failed: number;
+  uncertain: number;
+  skipped: number;
+  sending: number;
+  pending: number;
+  total: number;
+  status: CampaignStatus;
+  pause_reason?: string | null;
+  resume_at?: number | null;
+  elapsed_ms: number;
+  emails_per_min: number;
+  timing_summary?: TimingSummary | null;
+}
+
+export interface CampaignEventsResponse {
+  success: true;
+  events: JobEvent[];
+  nextCursor: number;
+  summary: EventsSummary;
+}
+
+export interface QueueItem {
+  position: number;
+  id: string;
+  campaignId: string;
+  studentId: string;
+  studentName: string;
+  studentEmail: string;
+  status: JobStatus;
+  attempts: number;
+  lastError?: string | null;
+  nextAttemptAt?: number | null;
+}
+
+export interface CampaignQueueResponse {
+  success: true;
+  queue: QueueItem[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+export type JobStatus =
+  | 'pending'
+  | 'sending'
+  | 'sent'
+  | 'failed'
+  | 'uncertain'
+  | 'skipped'
+  | 'cancelled';
+
+export interface CampaignJob {
+  id: string;
+  campaignId: string;
+  userId: string;
+  studentId: string;
+  studentName: string;
+  studentEmail: string;
+  contentDocumentId?: string | null;
+  contentVersionId?: string | null;
+  fileName?: string | null;
+  status: JobStatus;
+  attempts: number;
+  lastError?: string | null;
+  smtpMessageId?: string | null;
+  sentAt?: number | null;
+  nextAttemptAt?: number | null;
+  updatedAt: number;
+}
+
+export interface CreateCampaignReviewResponse {
+  success: true;
+  campaignId: string;
+  campaign: CampaignV2;
+  counts: {
+    total: number;
+    willSend: number;
+    skipped: {
+      noFile: number;
+      invalidEmail: number;
+      alreadySent: number;
+      total: number;
+    };
+  };
+  recipientsPerEmail: number;
+  dailyLimitRemaining: number;
+  estimatedDurationSeconds: number;
+}
+
+export interface ProcessCampaignResponse {
+  success: true;
+  campaign: CampaignV2;
+  counts: CampaignCounts;
+  processed: number;
+  remaining: number;
+  message?: string;
+}
+
 export interface CampaignProgress {
   id: string;
   name: string;

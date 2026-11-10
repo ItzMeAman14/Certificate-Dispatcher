@@ -21,6 +21,7 @@ import {
   Send,
   Users,
   LogOut,
+  FolderOpen,
   PenLine,
   Plug,
   Settings as SettingsIcon,
@@ -30,6 +31,7 @@ import {
 import { ApiError, api } from '../api.ts';
 import type {
   CampaignProgress,
+  CampaignV2,
   ConnectionInfo,
   DeliveriesResponse,
   DeliveryCounts,
@@ -44,6 +46,9 @@ import SettingsModal from './SettingsModal.tsx';
 import DataSourceModal from './DataSourceModal.tsx';
 import EmailTemplateEditor, { getDefaultTemplate, normalizeTemplate } from './EmailTemplateEditor.tsx';
 import type { EmailTemplate } from './EmailTemplateEditor.tsx';
+import CampaignReviewModal from './CampaignReviewModal.tsx';
+import CampaignRunningView from './CampaignRunningView.tsx';
+import CampaignsListModal from './CampaignsListModal.tsx';
 import Footer from './Footer.tsx';
 
 /* -------------------------------------------------------------------------- */
@@ -315,11 +320,11 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
 
   // Campaign background queue state
   const [activeCampaign, setActiveCampaign] = useState<CampaignProgress | null>(null);
-  const [isQueueing, setIsQueueing] = useState(false);
+  const isQueueing = false;
   const [isRetrying, setIsRetrying] = useState(false);
   const [sendingStudentIds, setSendingStudentIds] = useState<Set<string>>(new Set());
 
-  // Modals
+  // Modals & Campaign views
   const [template, setTemplate] = useState<EmailTemplate>(getDefaultTemplate);
   const [templateReady, setTemplateReady] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
@@ -327,6 +332,29 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [dataSourceOpen, setDataSourceOpen] = useState(false);
   const [confirmAllOpen, setConfirmAllOpen] = useState(false);
+  const [activeCampaignV2, setActiveCampaignV2] = useState<CampaignV2 | null>(null);
+  const [currentView, setCurrentView] = useState<'table' | 'campaign'>('table');
+  const [campaignsModalOpen, setCampaignsModalOpen] = useState(false);
+  const [reviewModalOpen, setReviewModalOpen] = useState(false);
+  const [reviewTarget, setReviewTarget] = useState<'all' | string[]>('all');
+  const [detectedCampaign, setDetectedCampaign] = useState<CampaignV2 | null>(null);
+
+  // Tab-close resistance: detect any in-flight running or paused campaigns on startup
+  useEffect(() => {
+    api<{ success: true; campaigns: CampaignV2[] }>('/api/campaigns')
+      .then((res) => {
+        const active = (res.campaigns || []).find(
+          (c) =>
+            c.status === 'running' ||
+            c.status.startsWith('paused')
+        );
+        if (active) {
+          setActiveCampaignV2(active);
+          setDetectedCampaign(active);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   /* ------------------------------ Data loading ----------------------------- */
 
@@ -615,91 +643,111 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
     setRefreshing(false);
   };
 
-  /** Scale to 500 students: queues jobs in NeonDB background worker */
-  const queueCampaign = async (targets: StudentRow[]) => {
-    // Filter out targets that are already currently being queued/sent
-    const pendingTargets = targets.filter((t) => !sendingStudentIds.has(t.student.Id));
-    if (pendingTargets.length === 0) return;
+  /** Fast direct send for individual student row */
+  const handleSendIndividual = async (student: Student, cert: Certificate) => {
+    if (sendingStudentIds.has(student.Id)) return;
+    if (!me.emailConfigured) {
+      setSettingsOpen(true);
+      setAlertNotice({
+        type: 'error',
+        text: 'Please configure your sender email in Settings first.',
+      });
+      return;
+    }
 
-    // Immediately track in-flight target IDs to prevent rapid double-clicks
-    setSendingStudentIds((prev) => {
-      const next = new Set(prev);
-      pendingTargets.forEach((t) => next.add(t.student.Id));
-      return next;
-    });
-    setIsQueueing(true);
+    setSendingStudentIds((prev) => new Set(prev).add(student.Id));
     setAlertNotice(null);
 
     try {
-      const items = pendingTargets.map((t) => ({
-        studentId: t.student.Id,
-        studentName: t.student.Name,
-        recipientEmail: t.student.Email__c,
-        certificateId: t.certificate?.documentId,
-        certificateName: t.certificate?.fileName,
-      }));
-
       const res = await api<{
         success: true;
-        campaignId: string;
-        queuedCount: number;
-        leftForLater?: number;
+        deliveryId: string;
+        sentAt: number;
         quota?: QuotaInfo;
         message: string;
-      }>('/api/campaigns/queue', {
+      }>('/api/send-email', {
         method: 'POST',
         body: {
-          name: `Dispatch ${new Date().toLocaleDateString()} (${items.length} students)`,
+          studentId: student.Id,
+          studentEmail: student.Email__c,
+          studentName: student.Name,
+          contentDocumentId: cert.documentId,
           subject: template.subject,
           htmlTemplate: template.html,
-          items,
         },
       });
 
       if (res.quota) setQuota(res.quota);
+      student.SentAt = res.sentAt || Date.now();
 
-      // Start progress tracking
-      setActiveCampaign({
-        id: res.campaignId,
-        name: `Dispatch (${res.queuedCount} students)`,
+      // Update deliveriesMap immediately with complete DeliveryRecord
+      const now = Date.now();
+      const sentDelivery: DeliveryRecord = {
+        id: res.deliveryId,
+        userId: me.user.id,
+        studentId: student.Id,
+        studentName: student.Name,
+        recipientEmail: student.Email__c,
+        certificateId: cert.documentId,
+        certificateName: cert.fileName,
         subject: template.subject,
-        totalRecipients: res.queuedCount,
-        queuedCount: res.queuedCount,
-        sentCount: 0,
-        failedCount: 0,
-        bouncedCount: 0,
-        status: 'queued',
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      });
+        status: 'sent',
+        attempts: 1,
+        maxAttempts: 3,
+        sentAt: res.sentAt || now,
+        createdAt: now,
+        updatedAt: now,
+      };
 
-      const msg = res.leftForLater && res.leftForLater > 0
-        ? `Queued ${res.queuedCount} certificate(s). ${res.leftForLater} left for later due to daily limit.`
-        : `Queued ${res.queuedCount} certificate(s) for background dispatch.`;
+      setDeliveriesMap((prev) => ({
+        ...prev,
+        [student.Id]: sentDelivery,
+      }));
+
+      // Increment sent count
+      setCounts((prev) => ({
+        ...prev,
+        sent: (prev?.sent || 0) + 1,
+      }));
 
       setAlertNotice({
         type: 'success',
-        text: msg,
+        text: res.message || `Certificate email sent to ${student.Email__c}`,
       });
-
-      // Clear selections for queued students
-      setSelectedIds((prev) => {
-        const next = new Set(prev);
-        pendingTargets.forEach((t) => next.delete(t.student.Id));
-        return next;
-      });
-
-      await loadDeliveries();
     } catch (err) {
+      const msg = errorMessage(err, 'Could not send certificate email.');
+      const now = Date.now();
+      const failedDelivery: DeliveryRecord = {
+        id: deliveriesMap[student.Id]?.id || `failed_${student.Id}`,
+        userId: me.user.id,
+        studentId: student.Id,
+        studentName: student.Name,
+        recipientEmail: student.Email__c,
+        certificateId: cert.documentId,
+        certificateName: cert.fileName,
+        subject: template.subject,
+        status: 'failed',
+        attempts: 1,
+        maxAttempts: 3,
+        errorMessage: msg,
+        lastErrorAt: now,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      setDeliveriesMap((prev) => ({
+        ...prev,
+        [student.Id]: failedDelivery,
+      }));
+
       setAlertNotice({
         type: 'error',
-        text: errorMessage(err, 'Failed to queue campaign. Please check mail settings.'),
+        text: msg,
       });
     } finally {
-      setIsQueueing(false);
       setSendingStudentIds((prev) => {
         const next = new Set(prev);
-        pendingTargets.forEach((t) => next.delete(t.student.Id));
+        next.delete(student.Id);
         return next;
       });
     }
@@ -731,15 +779,14 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
   };
 
   const sendSelected = () => {
-    const targets = rows.filter(
-      (r) => r.certificate && selectedIds.has(r.student.Id)
-    );
-    void queueCampaign(targets);
+    setReviewTarget(Array.from(selectedIds));
+    setReviewModalOpen(true);
   };
 
   const sendAll = () => {
     setConfirmAllOpen(false);
-    void queueCampaign(readyToSendAll);
+    setReviewTarget('all');
+    setReviewModalOpen(true);
   };
 
   const toggleOne = (id: string) =>
@@ -853,12 +900,33 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
               </span>
             </div>
           )}
+
+          {activeCampaignV2 && (
+            <button
+              type="button"
+              onClick={() => setCurrentView(currentView === 'campaign' ? 'table' : 'campaign')}
+              className="inline-flex items-center gap-1.5 rounded-full border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-xs font-semibold text-indigo-700 shadow-2xs hover:bg-indigo-100 cursor-pointer"
+              title={currentView === 'campaign' ? 'Switch back to Student List' : 'Switch to Campaign Running View'}
+            >
+              <span className={`h-2 w-2 rounded-full ${activeCampaignV2.status === 'running' ? 'bg-indigo-600 animate-pulse' : 'bg-amber-500'}`} />
+              <span>{currentView === 'campaign' ? '← Student List' : `Campaign: ${activeCampaignV2.name}`}</span>
+            </button>
+          )}
         </div>
 
         <div className="flex items-center gap-1 sm:gap-2">
           <span className="hidden max-w-[14rem] truncate text-xs text-slate-500 sm:inline">
             {me.user.email}
           </span>
+          <button
+            type="button"
+            onClick={() => setCampaignsModalOpen(true)}
+            className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100 cursor-pointer"
+            title="View campaigns history and manage runs"
+          >
+            <FolderOpen className="h-4 w-4" aria-hidden />
+            Campaigns
+          </button>
           <button
             type="button"
             onClick={() => setSettingsOpen(true)}
@@ -885,8 +953,71 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
       {topBar}
 
       <div className="mx-auto w-full max-w-7xl flex-1 px-4 py-8 sm:px-6 lg:px-8">
-        {/* Header and Bulk Action Buttons */}
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        {activeCampaignV2 && currentView === 'campaign' ? (
+          <CampaignRunningView
+            initialCampaign={activeCampaignV2}
+            onBackToStudents={() => setCurrentView('table')}
+            onOpenSettings={() => setSettingsOpen(true)}
+          />
+        ) : (
+          <>
+            {/* Active Campaign Banner in Student List view */}
+            {activeCampaignV2 && currentView === 'table' && (
+              <div className="mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-xl border border-indigo-200 bg-indigo-50 p-4 text-xs text-indigo-950 shadow-sm">
+                <div className="flex items-center gap-2.5">
+                  <span className={`h-2.5 w-2.5 rounded-full ${activeCampaignV2.status === 'running' ? 'bg-indigo-600 animate-pulse' : 'bg-amber-500'}`} />
+                  <div>
+                    <strong>Active Campaign:</strong> &ldquo;{activeCampaignV2.name}&rdquo; is currently{' '}
+                    <span className="font-semibold">{activeCampaignV2.status}</span>.
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setCurrentView('campaign')}
+                    className="rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-xs hover:bg-indigo-700 cursor-pointer"
+                  >
+                    Open Campaign View →
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Tab-close Recovery Banner (if active campaign detected and not yet set) */}
+            {detectedCampaign && !activeCampaignV2 && (
+              <div className="mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-xl border border-indigo-200 bg-indigo-50 p-4 text-xs text-indigo-950 shadow-sm">
+                <div className="flex items-center gap-2.5">
+                  <span className="h-2.5 w-2.5 rounded-full bg-indigo-600 animate-pulse" />
+                  <div>
+                    <strong>Active Campaign Detected:</strong> &ldquo;{detectedCampaign.name}&rdquo; is currently{' '}
+                    <span className="font-semibold">{detectedCampaign.status}</span>.
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveCampaignV2(detectedCampaign);
+                      setCurrentView('campaign');
+                      setDetectedCampaign(null);
+                    }}
+                    className="rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-xs hover:bg-indigo-700 cursor-pointer"
+                  >
+                    Open Running View
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDetectedCampaign(null)}
+                    className="rounded-lg p-1 text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Header and Bulk Action Buttons */}
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h1 className="text-2xl font-bold tracking-tight text-slate-900">Certificate Dispatcher</h1>
             <p className="mt-1 text-sm text-slate-500">
@@ -1372,7 +1503,7 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
                         <td className="px-4 py-3.5 text-right">
                           <button
                             type="button"
-                            onClick={() => certificate && void queueCampaign([{ student, certificate }])}
+                            onClick={() => certificate && void handleSendIndividual(student, certificate)}
                             disabled={!certificate || isRowBusy || isQueueing || !canSend}
                             className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium shadow-xs transition cursor-pointer ${
                               isRowBusy
@@ -1466,6 +1597,8 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
             </div>
           </div>
         </section>
+        </>
+      )}
       </div>
 
       {/* Confirmation Modal (Requirement 4: Quota safety & left-for-later reporting) */}
@@ -1573,6 +1706,38 @@ export default function CertificateDispatcher({ me, onMeChange, onUnauthorized, 
           onClose={() => setSettingsOpen(false)}
         />
       )}
+
+      {/* Campaign Review & Pre-Launch Modal */}
+      {reviewModalOpen && (
+        <CampaignReviewModal
+          studentIds={reviewTarget}
+          totalSelectedCount={reviewTarget === 'all' ? readyToSendAll.length : selectedIds.size}
+          templateSubject={template.subject}
+          templateHtml={template.html}
+          settings={me.settings}
+          quota={quota}
+          userEmail={me.user.email}
+          onLaunch={(launchedCampaign) => {
+            setReviewModalOpen(false);
+            setActiveCampaignV2(launchedCampaign);
+            setCurrentView('campaign');
+            setSelectedIds(new Set());
+            void loadStudents();
+          }}
+          onClose={() => setReviewModalOpen(false)}
+        />
+      )}
+
+      {/* Campaigns History & Management Modal */}
+      <CampaignsListModal
+        isOpen={campaignsModalOpen}
+        onClose={() => setCampaignsModalOpen(false)}
+        activeCampaignId={activeCampaignV2?.id}
+        onSelectCampaign={(c) => {
+          setActiveCampaignV2(c);
+          setCurrentView('campaign');
+        }}
+      />
 
       {/* Required Footer Branding */}
       <Footer />
