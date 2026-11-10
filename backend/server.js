@@ -2220,6 +2220,9 @@ app.use((err, req, res, _next) => {
 
 app.executeCampaignBatch = executeCampaignBatch;
 module.exports = app;
+module.exports.config = {
+  maxDuration: 60,
+};
 
 if (require.main === module) {
   const server = app.listen(PORT, () => {
